@@ -6,15 +6,17 @@
 # ║  Project: gig.ovh                                              ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=1.0.3
+# VERSION=1.0.4
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
     shift
 fi
+
+# Note: sudo bash <(curl …) fails — /dev/fd/N is not visible inside sudo. Use: curl … | bash -s --
 
 set -euo pipefail
 
@@ -25,6 +27,10 @@ STATE_FILE="$REALSTEAL_DIR/realsteal.env"
 LOG_FILE="/var/log/realsteal.log"
 SCRIPT_URL="https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh"
 UPDATE_URL="$SCRIPT_URL"
+
+curl_install_pipe() {
+    printf 'curl -fsSL %s | bash -s --' "$UPDATE_URL"
+}
 
 STANDALONE_FRONT_DIR="$REALSTEAL_DIR/front"
 SELFSTEAL_DIR="/opt/nginx-selfsteal"
@@ -1477,7 +1483,7 @@ install_command() {
 
     if [ "$FORCE_MODE" = true ] && [ -z "$FORCE_DOMAIN" ]; then
         log_error "Force mode requires --domain"
-        echo -e "${GRAY}   Example: bash <(curl -Ls ${UPDATE_URL}) @ --force --domain reality.example.com install${NC}"
+        echo -e "${GRAY}   Example: $(curl_install_pipe) @ --force --domain reality.example.com install${NC}"
         return 1
     fi
 
@@ -1639,7 +1645,7 @@ guide_command_brief() {
 
 guide_command() {
     require_installed
-    clear
+    clear 2>/dev/null || true
     echo -e "${WHITE}📖 $(t guide_title)${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
     echo
@@ -1830,8 +1836,15 @@ $(t menu_title) v${SCRIPT_VERSION}
 
 Usage: $APP_NAME [options] <command> [args]
 
-Remote one-liner (install + register command):
-  bash <(curl -Ls ${UPDATE_URL}) @ --force --domain reality.example.com install
+Remote one-liner (works with sudo — do NOT use bash <(curl …) with sudo):
+
+  $(curl_install_pipe) @ --force --domain reality.example.com install
+
+  # already root:
+  curl -fsSL ${UPDATE_URL} | bash -s -- @ --force --domain reality.example.com install
+
+  # via sudo:
+  curl -fsSL ${UPDATE_URL} | sudo bash -s -- @ --force --domain reality.example.com install
 
 After install use: realsteal menu | realsteal status | realsteal
 
@@ -1860,9 +1873,9 @@ Options:
   --help|--version
 
 Examples:
-  bash <(curl -Ls ${UPDATE_URL}) @ install
-  bash <(curl -Ls ${UPDATE_URL}) @ --force --domain vpn.example.com install
-  bash <(curl -Ls ${UPDATE_URL}) @ --force --domain vpn.example.com --adopt install
+  $(curl_install_pipe) @ install
+  $(curl_install_pipe) @ --force --domain vpn.example.com install
+  $(curl_install_pipe) @ --force --domain vpn.example.com --adopt install
   realsteal menu
   realsteal --lang en status
 
@@ -1923,7 +1936,7 @@ main_menu() {
     detect_language
     ensure_management_script
     while true; do
-        clear
+        clear 2>/dev/null || true
         state_load
         menu_runtime_status
 
@@ -2012,7 +2025,7 @@ main_menu() {
             10) renew_ssl_command; read -r -p "$(t menu_press_enter)" _ ;;
             11) guide_command ;;
             12) uninstall_command; read -r -p "$(t menu_press_enter)" _ ;;
-            0) clear; exit 0 ;;
+            0) clear 2>/dev/null || true; exit 0 ;;
             *)
                 echo -e "${RED}❌ ?${NC}"
                 sleep 1

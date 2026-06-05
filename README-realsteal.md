@@ -6,21 +6,38 @@
 
 Репозиторий: [Khalif-abd/remnawave-scripts](https://github.com/Khalif-abd/remnawave-scripts)
 
+**Важно:** не используйте `sudo bash <(curl …)` — будет ошибка `/dev/fd/63: No such file or directory`.  
+Process substitution (`<(…)`) не передаётся в `sudo`. Используйте **pipe**:
+
 ```bash
-# Интерактивная установка (меню на русском по умолчанию)
-bash <(curl -Ls https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh) @ install
+# Вы уже root — так:
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh | \
+  bash -s -- @ --nginx --force --domain meet2.work-mesh.org install
 
-# Non-interactive: домен + jitsi + auth B + auto adopt если есть selfsteal
-bash <(curl -Ls https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh) @ \
-  --force --domain reality.example.com install
+# Или через sudo (curl без sudo, bash внутри sudo):
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh | \
+  sudo bash -s -- @ --nginx --force --domain meet2.work-mesh.org install
+```
 
-# Явно adopt (если уже стоит selfsteal nginx)
-bash <(curl -Ls https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh) @ \
-  --force --domain reality.example.com --adopt install
+Интерактивная установка:
 
-# Флаг --nginx — алиас для привычки от selfsteal (игнорируется, realsteal всегда nginx)
-bash <(curl -Ls https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh) @ \
-  --nginx --force --domain reality.example.com install
+```bash
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh | bash -s -- @ install
+```
+
+Adopt (если уже стоит selfsteal nginx):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh | \
+  bash -s -- @ --force --domain meet2.work-mesh.org --adopt install
+```
+
+Альтернатива — скачать файл и запустить (удобно при отладке):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh -o /tmp/realsteal.sh
+chmod +x /tmp/realsteal.sh
+/tmp/realsteal.sh @ --force --domain meet2.work-mesh.org install
 ```
 
 После `install` команда **`realsteal`** ставится в `/usr/local/bin/realsteal`:
@@ -29,7 +46,26 @@ bash <(curl -Ls https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/m
 realsteal              # меню
 realsteal status
 realsteal guide
-realsteal --lang en menu   # английский UI
+realsteal --lang en menu
+```
+
+## Очистка старых копий
+
+Если раньше клали скрипт в `/` или `/root`:
+
+```bash
+rm -f /realsteal.sh /root/realsteal.sh
+# переустановка CLI из raw URL:
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh -o /usr/local/bin/realsteal
+chmod +x /usr/local/bin/realsteal
+```
+
+Полный сброс realsteal (осторожно — удалит Jitsi и конфиг):
+
+```bash
+realsteal uninstall
+rm -rf /opt/realsteal
+rm -f /usr/local/bin/realsteal
 ```
 
 ## Relationship to selfsteal
@@ -40,14 +76,6 @@ realsteal --lang en menu   # английский UI
 | Front | nginx/Caddy static | nginx reverse-proxy |
 | Coexistence | **Mutually exclusive** as active content front on one domain/node |
 
-- `selfsteal.sh` is **not modified**.
-- Only **one** Reality `dest` per node — choose either selfsteal **or** realsteal as the active front.
-
-## Front modes
-
-1. **standalone** — new nginx at `/opt/realsteal/front`, ACME certificate (TLS-ALPN via acme.sh), Unix socket `/dev/shm/nginx.sock` (default) or TCP.
-2. **adopt** — reuse existing selfsteal nginx at `/opt/nginx-selfsteal` (cert, socket, container). Config switches to reverse-proxy; `selfsteal template` would overwrite it — use `realsteal render` to regenerate.
-
 ## Install flags
 
 | Flag | Description |
@@ -57,53 +85,38 @@ realsteal --lang en menu   # английский UI
 | `--app jitsi` | App plugin (default) |
 | `--auth open\|b\|c` | Jitsi auth (default in `--force`: **b**) |
 | `--adopt` / `--standalone` | Front mode |
-| `--nginx` | Ignored (compatibility) |
+| `--nginx` | Ignored (compatibility with selfsteal habit) |
 | `--lang ru\|en` | UI language (**default: ru**) |
-| `--source <url>` | Custom raw URL for `realsteal.sh` when installing to `/usr/local/bin` |
 
 ## Commands
 
 ```text
-realsteal install
+realsteal install | up | down | restart | status | logs
 realsteal app list|install|uninstall|switch <name>
-realsteal up|down|restart|status|logs [app]
-realsteal auth <open|b|c>
-realsteal user add|del|list
+realsteal auth <open|b|c> | user add|del|list
 realsteal renew-ssl | guide | render | uninstall
 ```
 
-## State
-
-- `/opt/realsteal/realsteal.env` — domain, front mode, active app, auth, language
-- `/opt/realsteal/jitsi` — Jitsi Meet
-- Front dir: `/opt/realsteal/front` (standalone) or `/opt/nginx-selfsteal` (adopt)
-
-## Reality panel (after install)
+## Reality panel
 
 ```
-dest:     /dev/shm/nginx.sock   (socket mode) or 127.0.0.1:9443 (tcp)
+dest:     /dev/shm/nginx.sock
 xver:     1
 serverNames: ["your.domain.com"]
 ```
 
 ## Troubleshooting
 
-If Jitsi install failed with a YAML error:
+Jitsi YAML error:
 
 ```bash
 sudo rm -rf /opt/realsteal/jitsi
-sudo realsteal install
+realsteal install
 ```
 
-v1.0.2+ uses `docker-compose.override.yml` with `!reset` instead of patching upstream yaml.
+Проверка, что curl отдаёт скрипт:
 
-## Apps
-
-| App | Status | Notes |
-|-----|--------|-------|
-| jitsi | ✅ | Video conferencing, UDP 10000 |
-| nextcloud | 🔜 | Contract stub only |
-
-## i18n
-
-**Russian** by default; English via `--lang en` or `LANG=en_US`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh | head -3
+# должно быть: #!/usr/bin/env bash
+```

@@ -6,12 +6,9 @@
 # ║  Project: gig.ovh                                              ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=1.0.5
+# VERSION=1.1.0
 
-SCRIPT_VERSION="1.0.5"
-
-# Always print first (even if later steps fail). If you see nothing — curl delivered 0 bytes.
-echo "▶ Realsteal v${SCRIPT_VERSION} (bash ${BASH_VERSION})" >&2
+SCRIPT_VERSION="1.1.0"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -33,9 +30,45 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
     exit 1
 fi
 
+# Debug mode - set via --debug flag
+DEBUG_MODE=false
+SCRIPT_URL="https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh"
+UPDATE_URL="$SCRIPT_URL"
+
+# Pre-parse a couple of flags before enabling strict mode (mirrors selfsteal)
+_rs_pre=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --debug)
+            DEBUG_MODE=true
+            echo "🔧 DEBUG MODE ENABLED" >&2
+            shift
+            ;;
+        --source)
+            if [ -n "${2:-}" ] && [[ "$2" =~ realsteal\.sh$ ]]; then
+                SCRIPT_URL="$2"; UPDATE_URL="$2"; shift 2
+            else
+                echo "Error: --source must be a URL to a realsteal.sh file" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            _rs_pre+=("$1"); shift
+            ;;
+    esac
+done
+[ ${#_rs_pre[@]} -gt 0 ] && set -- "${_rs_pre[@]}"
+unset _rs_pre
+
 # Note: sudo bash <(curl …) fails — use: curl -fsSL URL -o /tmp/realsteal.sh && bash /tmp/realsteal.sh …
 
-set -euo pipefail
+# Only enable strict mode if not debugging
+if [ "$DEBUG_MODE" = true ]; then
+    set -u
+    trap 'echo "❌ ERROR at line $LINENO: $BASH_COMMAND (exit code: $?)" >&2' ERR
+else
+    set -euo pipefail
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /tmp)"
 
@@ -50,8 +83,6 @@ if [ "$(id -u)" -eq 0 ]; then
 else
     LOG_FILE="/tmp/realsteal.log"
 fi
-SCRIPT_URL="https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh"
-UPDATE_URL="$SCRIPT_URL"
 
 curl_install_pipe() {
     printf 'curl -fsSL %s | bash -s --' "$UPDATE_URL"
@@ -67,7 +98,6 @@ NGINX_VERSION="1.29.3-alpine"
 SOCKET_PATH="/dev/shm/nginx.sock"
 DEFAULT_TCP_PORT="9443"
 
-DEBUG_MODE=false
 FORCE_MODE=false
 FORCE_DOMAIN=""
 FORCE_APP=""
@@ -182,7 +212,7 @@ init_i18n() {
         [menu_tip_running]="Tip: open https://%s in browser to verify the showcase app"
         [menu_tip_stopped]="Tip: use Start services to bring everything up"
         [menu_tip_error]="Tip: check logs if containers keep restarting"
-        [menu_select]="Select option [0-12]:"
+        [menu_select]="Select option [0-13]:"
         [menu_press_enter]="Press Enter to continue..."
         [label_status]="Status"
         [label_version]="Version"
@@ -196,6 +226,44 @@ init_i18n() {
         [jitsi_creds]="Jitsi user created — save these credentials (shown once):"
         [uninstall_adopt_restore]="Adopted front restored to selfsteal static config backup"
         [uninstall_adopt_manual]="Adopted front: restore selfsteal manually with 'selfsteal template' if needed"
+        [upd_checking]="Checking for updates..."
+        [upd_fetch_fail]="Unable to fetch latest version"
+        [upd_current]="Current version"
+        [upd_latest]="Latest version"
+        [upd_uptodate]="You are running the latest version"
+        [upd_available]="A new version is available!"
+        [upd_confirm]="Update now? [y/N]:"
+        [upd_downloading]="Downloading latest version..."
+        [upd_download_fail]="Failed to download update"
+        [upd_done]="Updated successfully — restart the script"
+        [help_remote_title]="Remote install (download first, NOT pipe)"
+        [help_remote_note]="If 'curl | bash' shows nothing, curl failed silently — use the lines below"
+        [help_opt_force]="Non-interactive install (requires --domain)"
+        [help_opt_domain]="Domain for installation"
+        [help_opt_app]="App plugin (default: jitsi)"
+        [help_opt_auth]="Jitsi auth mode (default in --force: b)"
+        [help_opt_adopt]="Reuse existing selfsteal nginx front"
+        [help_opt_standalone]="New nginx front (default if no selfsteal)"
+        [help_opt_lang]="UI language (default: ru)"
+        [help_opt_source]="Custom script URL for self-install/update"
+        [help_cmd_install]="Install front + showcase app"
+        [help_cmd_up]="Start front + app services"
+        [help_cmd_down]="Stop front + app services"
+        [help_cmd_restart]="Restart services"
+        [help_cmd_status]="Show service status"
+        [help_cmd_logs]="Show logs (front|app)"
+        [help_cmd_app]="list|install|uninstall|switch <name>"
+        [help_cmd_auth]="Jitsi auth mode (open|b|c)"
+        [help_cmd_user]="Jitsi users (add|del|list)"
+        [help_cmd_renew]="Renew Let's Encrypt certificate"
+        [help_cmd_guide]="Reality dest/serverNames reminder"
+        [help_cmd_doctor]="Diagnose curl/stale scripts/state"
+        [help_cmd_uninstall]="Remove realsteal (+ restore adopt)"
+        [help_cmd_menu]="Show interactive menu (default)"
+        [help_cmd_update]="Check for script updates"
+        [help_examples]="Examples"
+        [help_note_exclusive]="Note: realsteal and selfsteal are mutually exclusive as content front."
+        [menu_update]="Check for updates"
     )
     T_RU=(
         [err_root]="Скрипт нужно запускать от root (sudo)"
@@ -259,7 +327,7 @@ init_i18n() {
         [menu_tip_running]="Подсказка: откройте https://%s — проверьте витрину"
         [menu_tip_stopped]="Подсказка: «Запустить сервисы» поднимет всё"
         [menu_tip_error]="Подсказка: смотрите логи, если контейнеры перезапускаются"
-        [menu_select]="Выберите пункт [0-12]:"
+        [menu_select]="Выберите пункт [0-13]:"
         [menu_press_enter]="Нажмите Enter..."
         [label_status]="Статус"
         [label_version]="Версия"
@@ -273,6 +341,44 @@ init_i18n() {
         [jitsi_creds]="Создан пользователь Jitsi — сохраните (показывается один раз):"
         [uninstall_adopt_restore]="Фронт selfsteal восстановлен из бэкапа статики"
         [uninstall_adopt_manual]="Adopt: при необходимости восстановите selfsteal через 'selfsteal template'"
+        [upd_checking]="Проверка обновлений..."
+        [upd_fetch_fail]="Не удалось получить последнюю версию"
+        [upd_current]="Текущая версия"
+        [upd_latest]="Доступная версия"
+        [upd_uptodate]="Установлена последняя версия"
+        [upd_available]="Доступна новая версия!"
+        [upd_confirm]="Обновить сейчас? [y/N]:"
+        [upd_downloading]="Скачивание новой версии..."
+        [upd_download_fail]="Не удалось скачать обновление"
+        [upd_done]="Обновлено успешно — перезапустите скрипт"
+        [help_remote_title]="Удалённая установка (сначала скачать, НЕ pipe)"
+        [help_remote_note]="Если 'curl | bash' ничего не выводит — curl упал молча, используйте строки ниже"
+        [help_opt_force]="Неинтерактивная установка (нужен --domain)"
+        [help_opt_domain]="Домен для установки"
+        [help_opt_app]="Приложение-витрина (по умолчанию: jitsi)"
+        [help_opt_auth]="Режим авторизации Jitsi (по умолчанию в --force: b)"
+        [help_opt_adopt]="Переиспользовать существующий фронт selfsteal"
+        [help_opt_standalone]="Новый фронт nginx (по умолчанию без selfsteal)"
+        [help_opt_lang]="Язык интерфейса (по умолчанию: ru)"
+        [help_opt_source]="Свой URL скрипта для self-install/обновления"
+        [help_cmd_install]="Установить фронт + приложение-витрину"
+        [help_cmd_up]="Запустить фронт + приложение"
+        [help_cmd_down]="Остановить фронт + приложение"
+        [help_cmd_restart]="Перезапустить сервисы"
+        [help_cmd_status]="Показать статус сервисов"
+        [help_cmd_logs]="Показать логи (front|app)"
+        [help_cmd_app]="list|install|uninstall|switch <name>"
+        [help_cmd_auth]="Режим авторизации Jitsi (open|b|c)"
+        [help_cmd_user]="Пользователи Jitsi (add|del|list)"
+        [help_cmd_renew]="Обновить сертификат Let's Encrypt"
+        [help_cmd_guide]="Памятка по dest/serverNames для Reality"
+        [help_cmd_doctor]="Диагностика curl/старых копий/состояния"
+        [help_cmd_uninstall]="Удалить realsteal (+ вернуть adopt)"
+        [help_cmd_menu]="Интерактивное меню (по умолчанию)"
+        [help_cmd_update]="Проверить обновления скрипта"
+        [help_examples]="Примеры"
+        [help_note_exclusive]="realsteal и selfsteal взаимоисключающи как витрина-фронт."
+        [menu_update]="Проверить обновления"
     )
 }
 
@@ -321,6 +427,14 @@ log_error() {
     echo -e "${RED}❌ $*${NC}" >&2
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
+
+cleanup_on_error() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ] && [ "$DEBUG_MODE" = true ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [EXIT] script exited with code $exit_code" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+trap cleanup_on_error EXIT
 
 create_dir_safe() {
     local dir="$1"
@@ -1493,12 +1607,18 @@ install_management_script() {
         log_warning "Could not copy to $target (already exists?)"
     fi
 
-    [[ "$script_path" == /tmp/realsteal-install-* ]] && rm -f "$script_path"
+    if [[ "$script_path" == /tmp/realsteal-install-* ]]; then
+        rm -f "$script_path"
+    fi
+    return 0
 }
 
 ensure_management_script() {
     [ -x "/usr/local/bin/$APP_NAME" ] && return 0
-    [ "${EUID:-$(id -u)}" -eq 0 ] && install_management_script
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        install_management_script || true
+    fi
+    return 0
 }
 
 doctor_command() {
@@ -1533,7 +1653,6 @@ doctor_command() {
 # ── Commands ─────────────────────────────────────────────────────
 install_command() {
     check_running_as_root
-    ensure_management_script
     log_info "$(t info_installing)"
 
     if [ "$FORCE_MODE" = true ] && [ -z "$FORCE_DOMAIN" ]; then
@@ -1885,57 +2004,126 @@ uninstall_command() {
     log_success "$(t ok_uninstalled)"
 }
 
+# ── Self-update (mirrors selfsteal) ───────────────────────────────
+check_for_updates() {
+    echo -e "${WHITE}🔍 $(t upd_checking)${NC}"
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️  curl not available, cannot check for updates${NC}"
+        return 1
+    fi
+    local remote_version
+    remote_version=$(curl -s "$UPDATE_URL" 2>/dev/null | grep '^SCRIPT_VERSION=' | head -1 | cut -d'"' -f2)
+    if [ -z "$remote_version" ]; then
+        echo -e "${YELLOW}⚠️  $(t upd_fetch_fail)${NC}"
+        return 1
+    fi
+    echo -e "${WHITE}📝 $(t upd_current): ${GRAY}v$SCRIPT_VERSION${NC}"
+    echo -e "${WHITE}📦 $(t upd_latest):  ${GRAY}v$remote_version${NC}"
+    echo
+    if [ "$SCRIPT_VERSION" = "$remote_version" ]; then
+        echo -e "${GREEN}✅ $(t upd_uptodate)${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}🔄 $(t upd_available)${NC}"
+    if [ "$FORCE_MODE" != true ]; then
+        read -r -p "$(t upd_confirm) " do_upd
+        [[ "$do_upd" =~ ^[Yy]$ ]] || return 0
+    fi
+    update_script
+}
+
+update_script() {
+    local target="/usr/local/bin/$APP_NAME"
+    local tmp="/tmp/realsteal-update-$$.sh"
+    echo -e "${WHITE}⬇️  $(t upd_downloading)${NC}"
+    if ! curl -fsSL "$UPDATE_URL" -o "$tmp" 2>/dev/null; then
+        log_error "$(t upd_download_fail)"
+        return 1
+    fi
+    if ! head -1 "$tmp" | grep -q '^#!.*bash'; then
+        log_error "$(t upd_download_fail)"
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ -f "$target" ]; then
+        cp "$target" "/tmp/realsteal-backup-$(date +%Y%m%d-%H%M%S).sh" 2>/dev/null || true
+    fi
+    if cp "$tmp" "$target" 2>/dev/null; then
+        chmod +x "$target"
+        rm -f "$tmp"
+        log_success "$(t upd_done)"
+    else
+        rm -f "$tmp"
+        log_warning "Could not update $target"
+    fi
+    return 0
+}
+
+check_for_updates_silent() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local remote_version
+    remote_version=$(curl -s --max-time 3 "$UPDATE_URL" 2>/dev/null | grep '^SCRIPT_VERSION=' | head -1 | cut -d'"' -f2)
+    [ -n "$remote_version" ] || return 0
+    if [ "$SCRIPT_VERSION" != "$remote_version" ]; then
+        echo -e "${YELLOW}🔄 $(t upd_available) (v$remote_version) — '$APP_NAME update'${NC}"
+        echo
+    fi
+    return 0
+}
+
+update_command() {
+    check_for_updates
+}
+
 show_help() {
-    cat <<EOF
-$(t menu_title) v${SCRIPT_VERSION}
-
-Usage: $APP_NAME [options] <command> [args]
-
-Remote install (recommended — download first, NOT pipe):
-
-  curl -fsSL ${UPDATE_URL} -o /tmp/realsteal.sh && \\
-    bash /tmp/realsteal.sh @ --force --domain reality.example.com install
-
-  If you see NO output with "curl | bash", curl failed silently — use the command above.
-
-  Pipe (only if curl works): $(curl_install_pipe) @ --force --domain DOMAIN install
-
-After install use: realsteal menu | realsteal status | realsteal
-
-Commands:
-  doctor                 Diagnose curl / stale scripts / install state
-  install              Interactive or --force install (front + app)
-  up|down|restart        Lifecycle front + app
-  status|logs [app]      Status and logs
-  app list|install|uninstall|switch <name>
-  auth <open|b|c>        Jitsi auth mode
-  user add|del|list      Jitsi users
-  renew-ssl              Renew Let's Encrypt certificate
-  guide                  Reality dest/serverNames reminder
-  uninstall              Remove realsteal (+ restore adopt backup)
-  menu                   Interactive menu (default)
-
-Options:
-  --force                Non-interactive install (requires --domain)
-  --domain <name>        Domain for install
-  --app <jitsi>          App plugin (default: jitsi)
-  --auth <open|b|c>      Jitsi auth (default in --force: b)
-  --adopt                Reuse selfsteal nginx front
-  --standalone           New nginx front (default if no selfsteal)
-  --nginx                Ignored (realsteal always uses nginx)
-  --lang en|ru           UI language (default: ru)
-  --source <url>         Custom script URL for self-install
-  --help|--version
-
-Examples:
-  $(curl_install_pipe) @ install
-  $(curl_install_pipe) @ --force --domain vpn.example.com install
-  $(curl_install_pipe) @ --force --domain vpn.example.com --adopt install
-  realsteal menu
-  realsteal --lang en status
-
-Note: realsteal and selfsteal are mutually exclusive as active content front.
-EOF
+    echo -e "${WHITE}$(t menu_title) v$SCRIPT_VERSION${NC}"
+    echo
+    echo -e "${WHITE}Usage:${NC}"
+    echo -e "  ${CYAN}$APP_NAME${NC} [${GRAY}command${NC}] [${GRAY}options${NC}]"
+    echo
+    echo -e "${WHITE}$(t help_remote_title):${NC}"
+    echo -e "  ${GRAY}# $(t help_remote_note)${NC}"
+    echo -e "  ${CYAN}curl -fsSL $UPDATE_URL -o /tmp/realsteal.sh${NC}"
+    echo -e "  ${CYAN}bash /tmp/realsteal.sh @ --force --domain reality.example.com install${NC}"
+    echo
+    echo -e "${WHITE}Force Install Options:${NC}"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--force, -f" "$(t help_opt_force)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--domain <domain>" "$(t help_opt_domain)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--app <jitsi>" "$(t help_opt_app)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--auth <open|b|c>" "$(t help_opt_auth)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--adopt" "$(t help_opt_adopt)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--standalone" "$(t help_opt_standalone)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--lang <en|ru>" "$(t help_opt_lang)"
+    printf "   ${CYAN}%-22s${NC} %s\n" "--source <url>" "$(t help_opt_source)"
+    echo
+    echo -e "${WHITE}Commands:${NC}"
+    printf "   ${CYAN}%-14s${NC} %s\n" "install" "🚀 $(t help_cmd_install)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "up" "▶️  $(t help_cmd_up)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "down" "⏹️  $(t help_cmd_down)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "restart" "🔄 $(t help_cmd_restart)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "status" "📊 $(t help_cmd_status)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "logs [app]" "📝 $(t help_cmd_logs)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "app <...>" "🎯 $(t help_cmd_app)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "auth <mode>" "🔐 $(t help_cmd_auth)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "user <...>" "👤 $(t help_cmd_user)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "renew-ssl" "🔐 $(t help_cmd_renew)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "guide" "📖 $(t help_cmd_guide)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "doctor" "🩺 $(t help_cmd_doctor)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "uninstall" "🗑️  $(t help_cmd_uninstall)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "menu" "📋 $(t help_cmd_menu)"
+    printf "   ${CYAN}%-14s${NC} %s\n" "update" "🔄 $(t help_cmd_update)"
+    echo
+    echo -e "${WHITE}$(t help_examples):${NC}"
+    echo -e "  ${CYAN}$APP_NAME --force --domain reality.example.com install${NC}"
+    echo -e "  ${CYAN}$APP_NAME --force --domain reality.example.com --adopt install${NC}"
+    echo -e "  ${CYAN}$APP_NAME menu${NC}"
+    echo
+    echo -e "${WHITE}Xray Reality:${NC}"
+    echo -e "  ${GRAY}Socket (default):  \"dest\": \"$SOCKET_PATH\", \"xver\": 1${NC}"
+    echo -e "  ${GRAY}TCP mode:          \"dest\": \"127.0.0.1:$DEFAULT_TCP_PORT\", \"xver\": 1${NC}"
+    echo
+    echo -e "${GRAY}$(t help_note_exclusive)${NC}"
+    echo -e "${GRAY}Project: gig.ovh | Fork: Khalif-abd${NC}"
 }
 
 menu_runtime_status() {
@@ -1990,6 +2178,7 @@ menu_runtime_status() {
 main_menu() {
     detect_language
     ensure_management_script
+    check_for_updates_silent
     while true; do
         clear 2>/dev/null || true
         state_load
@@ -1997,6 +2186,7 @@ main_menu() {
 
         echo -e "${WHITE}🎭 $(t menu_title)${NC}"
         echo -e "${GRAY}$(t label_version): ${SCRIPT_VERSION}${NC}  ${CYAN}|  realsteal + Reality${NC}"
+        echo -e "${CYAN}Project: gig.ovh | Fork: Khalif-abd${NC}"
         echo -e "${GRAY}$(printf '─%.0s' $(seq 1 52))${NC}"
         echo
 
@@ -2039,6 +2229,7 @@ main_menu() {
         echo
         echo -e "${WHITE}🗑️  $(t menu_section_maint):${NC}"
         echo -e "   ${WHITE}12)${NC} 🗑️  $(t menu_uninstall)"
+        echo -e "   ${WHITE}13)${NC} 🔄 $(t menu_update)"
         echo -e "   ${GRAY} 0)${NC} ⬅️  $(t menu_exit)"
         echo
 
@@ -2080,6 +2271,7 @@ main_menu() {
             10) renew_ssl_command; read -r -p "$(t menu_press_enter)" _ ;;
             11) guide_command ;;
             12) uninstall_command; read -r -p "$(t menu_press_enter)" _ ;;
+            13) update_command; read -r -p "$(t menu_press_enter)" _ ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *)
                 echo -e "${RED}❌ ?${NC}"
@@ -2159,8 +2351,10 @@ case "${COMMAND:-}" in
     render)
         require_installed
         render_front_conf && front_reload nginx ;;
+    update|check-update) update_command ;;
     menu|"") main_menu ;;
-    help) show_help ;;
+    help|--help|-h) show_help ;;
+    --version|-v) echo "Realsteal v$SCRIPT_VERSION" ;;
     *)
         if [ -n "$COMMAND" ]; then
             log_error "$(t err_unknown_cmd "$COMMAND")"

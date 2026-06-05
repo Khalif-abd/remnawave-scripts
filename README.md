@@ -37,6 +37,7 @@ After installation, manage services with: `remnawave`, `remnanode`, or `selfstea
 | **remnawave.sh** | Panel installer & manager | `remnawave <command>` |
 | **remnanode.sh** | Node installer & manager | `remnanode <command>` |
 | **selfsteal.sh** | Reality traffic masking | `selfsteal <command>` |
+| **realsteal.sh** | Real app front for Reality (Jitsi, …) | `realsteal <command>` |
 | **wtm.sh** | WARP & Tor Manager | `wtm <command>` |
 | **netbird.sh** | NetBird VPN installer | `netbird.sh <command>` |
 

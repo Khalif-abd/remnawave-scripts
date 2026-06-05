@@ -6,9 +6,9 @@
 # ║  Project: gig.ovh                                              ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=1.0.2
+# VERSION=1.0.3
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Handle @ prefix for consistency with other scripts
@@ -23,7 +23,8 @@ APP_NAME="realsteal"
 REALSTEAL_DIR="/opt/realsteal"
 STATE_FILE="$REALSTEAL_DIR/realsteal.env"
 LOG_FILE="/var/log/realsteal.log"
-SCRIPT_URL="https://raw.githubusercontent.com/dignezzz/remnawave-scripts/main/realsteal.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh"
+UPDATE_URL="$SCRIPT_URL"
 
 STANDALONE_FRONT_DIR="$REALSTEAL_DIR/front"
 SELFSTEAL_DIR="/opt/nginx-selfsteal"
@@ -37,9 +38,13 @@ DEFAULT_TCP_PORT="9443"
 
 DEBUG_MODE=false
 FORCE_MODE=false
+FORCE_DOMAIN=""
+FORCE_APP=""
+FORCE_AUTH=""
+FORCE_FRONT_MODE=""
 COMMAND=""
 ARGS=()
-LANGUAGE="en"
+LANGUAGE="ru"
 
 # ACME
 [ -z "${HOME:-}" ] && HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
@@ -259,9 +264,9 @@ detect_language() {
         saved=$(grep "^LANGUAGE=" "$STATE_FILE" 2>/dev/null | cut -d= -f2- || true)
         [ -n "$saved" ] && LANGUAGE="$saved" && return
     fi
-    case "${LANG:-en}" in
-        ru*|RU*) LANGUAGE="ru" ;;
-        *) LANGUAGE="en" ;;
+    case "${LANG:-ru}" in
+        en*|EN*) LANGUAGE="en" ;;
+        *) LANGUAGE="ru" ;;
     esac
 }
 
@@ -512,9 +517,13 @@ preflight_install_checks() {
     SERVER_IP="${SERVER_IP:-$(get_server_ip)}"
 
     if [ -f "$STATE_FILE" ] && [ -n "$(state_get DOMAIN "")" ]; then
-        log_warning "Realsteal already configured for $(state_get DOMAIN "")"
-        read -r -p "Reinstall / reconfigure? [y/N]: " re
-        [[ "$re" =~ ^[Yy]$ ]] || return 1
+        if [ "$FORCE_MODE" = true ]; then
+            log_info "Force mode: reconfiguring existing installation"
+        else
+            log_warning "Realsteal already configured for $(state_get DOMAIN "")"
+            read -r -p "Reinstall / reconfigure? [y/N]: " re
+            [[ "$re" =~ ^[Yy]$ ]] || return 1
+        fi
     fi
 
     validate_domain_dns "$DOMAIN" "$SERVER_IP" "$FORCE_MODE" || return 1
@@ -1423,12 +1432,42 @@ front_restore_adopt_backup() {
 }
 
 install_management_script() {
+    local script_path=""
     local target="/usr/local/bin/$APP_NAME"
-    local src="$0"
-    [ -f "$src" ] && [ "$src" != "bash" ] || src="$SCRIPT_DIR/realsteal.sh"
-    if [ -f "$src" ]; then
-        cp "$src" "$target" 2>/dev/null && chmod +x "$target" && log_success "Installed: $target"
+
+    if [ -f "$0" ] && [ "$0" != "bash" ] && [ "$0" != "@" ]; then
+        local src_real dst_real
+        src_real=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+        dst_real=$(realpath "$target" 2>/dev/null || readlink -f "$target" 2>/dev/null || echo "$target")
+        if [ "$src_real" = "$dst_real" ]; then
+            log_success "Management script already installed: $target"
+            return 0
+        fi
+        script_path="$0"
+    else
+        local temp_script="/tmp/realsteal-install-$$.sh"
+        log_info "Downloading management script from $UPDATE_URL ..."
+        if curl -fsSL "$UPDATE_URL" -o "$temp_script" 2>/dev/null; then
+            script_path="$temp_script"
+        else
+            log_warning "Could not download script; install manually from: $UPDATE_URL"
+            return 1
+        fi
     fi
+
+    if cp "$script_path" "$target" 2>/dev/null; then
+        chmod +x "$target"
+        log_success "Management script installed: $target"
+    else
+        log_warning "Could not copy to $target (already exists?)"
+    fi
+
+    [[ "$script_path" == /tmp/realsteal-install-* ]] && rm -f "$script_path"
+}
+
+ensure_management_script() {
+    [ -x "/usr/local/bin/$APP_NAME" ] && return 0
+    [ "${EUID:-$(id -u)}" -eq 0 ] && install_management_script
 }
 
 # ── Commands ─────────────────────────────────────────────────────
@@ -1436,26 +1475,41 @@ install_command() {
     check_running_as_root
     log_info "$(t info_installing)"
 
+    if [ "$FORCE_MODE" = true ] && [ -z "$FORCE_DOMAIN" ]; then
+        log_error "Force mode requires --domain"
+        echo -e "${GRAY}   Example: bash <(curl -Ls ${UPDATE_URL}) @ --force --domain reality.example.com install${NC}"
+        return 1
+    fi
+
     command -v docker >/dev/null 2>&1 || install_docker
     check_docker || return 1
 
     SERVER_IP=$(get_server_ip)
+    LANGUAGE="${LANGUAGE:-ru}"
 
     # Domain
-    if [ -z "$DOMAIN" ]; then
+    if [ -n "$FORCE_DOMAIN" ]; then
+        DOMAIN="$FORCE_DOMAIN"
+    elif [ -z "$DOMAIN" ]; then
         read -r -p "$(t prompt_domain): " DOMAIN
     fi
 
-    # App selection (early for preflight)
-    echo
-    echo "$(t prompt_app):"
-    echo "  1) jitsi — $(app_jitsi_meta | cut -d'|' -f3-)"
-    echo "  2) nextcloud — $(app_nextcloud_meta | cut -d'|' -f3-) [soon]"
-    read -r -p "Choice [1]: " app_choice
-    case "$app_choice" in
-        2) ACTIVE_APP="nextcloud" ;;
-        *) ACTIVE_APP="jitsi" ;;
-    esac
+    # App selection
+    if [ -n "$FORCE_APP" ]; then
+        ACTIVE_APP="$FORCE_APP"
+    elif [ "$FORCE_MODE" = true ]; then
+        ACTIVE_APP="jitsi"
+    else
+        echo
+        echo "$(t prompt_app):"
+        echo "  1) jitsi — $(app_jitsi_meta | cut -d'|' -f3-)"
+        echo "  2) nextcloud — $(app_nextcloud_meta | cut -d'|' -f3-) [soon]"
+        read -r -p "Choice [1]: " app_choice
+        case "$app_choice" in
+            2) ACTIVE_APP="nextcloud" ;;
+            *) ACTIVE_APP="jitsi" ;;
+        esac
+    fi
 
     if ! app_is_implemented "$ACTIVE_APP"; then
         log_error "$(t err_app_not_impl "$ACTIVE_APP")"
@@ -1465,32 +1519,47 @@ install_command() {
     preflight_install_checks "$ACTIVE_APP" || return 1
 
     # Front mode
-    echo
-    echo "$(t prompt_front_mode):"
-    echo "  $(t prompt_front_standalone)"
-    if detect_selfsteal_nginx; then
-        echo "  $(t prompt_front_adopt)"
+    if [ -n "$FORCE_FRONT_MODE" ]; then
+        FRONT_MODE="$FORCE_FRONT_MODE"
+    elif [ "$FORCE_MODE" = true ]; then
+        if detect_selfsteal_nginx; then
+            FRONT_MODE="adopt"
+            log_info "Force mode: selfsteal detected → adopt"
+        else
+            FRONT_MODE="standalone"
+        fi
+    else
+        echo
+        echo "$(t prompt_front_mode):"
+        echo "  $(t prompt_front_standalone)"
+        if detect_selfsteal_nginx; then
+            echo "  $(t prompt_front_adopt)"
+        fi
+        read -r -p "Choice [1/2]: " fm_choice
+        case "$fm_choice" in
+            2)
+                if detect_selfsteal_nginx; then
+                    FRONT_MODE="adopt"
+                else
+                    FRONT_MODE="standalone"
+                fi
+                ;;
+            *) FRONT_MODE="standalone" ;;
+        esac
     fi
-    read -r -p "Choice [1/2]: " fm_choice
-    case "$fm_choice" in
-        2)
-            if detect_selfsteal_nginx; then
-                FRONT_MODE="adopt"
-            else
-                FRONT_MODE="standalone"
-            fi
-            ;;
-        *) FRONT_MODE="standalone" ;;
-    esac
 
     if [ "$FRONT_MODE" = "standalone" ]; then
         FRONT_TYPE="socket"
         FRONT_DIR="$STANDALONE_FRONT_DIR"
         CONTAINER_NAME="$CONTAINER_NAME_STANDALONE"
         if detect_selfsteal_nginx && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "$CONTAINER_NAME_ADOPT"; then
-            log_warning "$(t info_selfsteal_conflict)"
-            read -r -p "$(t prompt_continue) " cont
-            [[ "$cont" =~ ^[Yy]$ ]] || return 1
+            if [ "$FORCE_MODE" = true ]; then
+                log_warning "$(t info_selfsteal_conflict) — force mode, continuing"
+            else
+                log_warning "$(t info_selfsteal_conflict)"
+                read -r -p "$(t prompt_continue) " cont
+                [[ "$cont" =~ ^[Yy]$ ]] || return 1
+            fi
         fi
         if [ -d "$CADDY_SELFSTEAL_DIR" ] && [ -f "$CADDY_SELFSTEAL_DIR/docker-compose.yml" ]; then
             log_warning "$(t info_selfsteal_conflict) (caddy at $CADDY_SELFSTEAL_DIR)"
@@ -1500,24 +1569,29 @@ install_command() {
         CONTAINER_NAME="$CONTAINER_NAME_ADOPT"
     fi
 
-    # App already selected above
-
     # Auth (jitsi)
     if [ "$ACTIVE_APP" = "jitsi" ]; then
-        echo
-        echo "$(t prompt_auth):"
-        echo "  $(t prompt_auth_open)"
-        echo "  $(t prompt_auth_b)"
-        echo "  $(t prompt_auth_c)"
-        read -r -p "Choice [2]: " auth_choice
-        case "$auth_choice" in
-            1) AUTH_MODE="open" ;;
-            3) AUTH_MODE="c" ;;
-            *) AUTH_MODE="b" ;;
-        esac
+        if [ -n "$FORCE_AUTH" ]; then
+            AUTH_MODE="$FORCE_AUTH"
+        elif [ "$FORCE_MODE" = true ]; then
+            AUTH_MODE="b"
+        else
+            echo
+            echo "$(t prompt_auth):"
+            echo "  $(t prompt_auth_open)"
+            echo "  $(t prompt_auth_b)"
+            echo "  $(t prompt_auth_c)"
+            read -r -p "Choice [2]: " auth_choice
+            case "$auth_choice" in
+                1) AUTH_MODE="open" ;;
+                3) AUTH_MODE="c" ;;
+                *) AUTH_MODE="b" ;;
+            esac
+        fi
     fi
 
     state_init_file
+    state_set LANGUAGE "$LANGUAGE"
     state_save_all
 
     # Install app
@@ -1756,8 +1830,13 @@ $(t menu_title) v${SCRIPT_VERSION}
 
 Usage: $APP_NAME [options] <command> [args]
 
+Remote one-liner (install + register command):
+  bash <(curl -Ls ${UPDATE_URL}) @ --force --domain reality.example.com install
+
+After install use: realsteal menu | realsteal status | realsteal
+
 Commands:
-  install              Interactive install (front + app)
+  install              Interactive or --force install (front + app)
   up|down|restart        Lifecycle front + app
   status|logs [app]      Status and logs
   app list|install|uninstall|switch <name>
@@ -1766,12 +1845,28 @@ Commands:
   renew-ssl              Renew Let's Encrypt certificate
   guide                  Reality dest/serverNames reminder
   uninstall              Remove realsteal (+ restore adopt backup)
-  menu                   Interactive menu
-  --lang en|ru           UI language
+  menu                   Interactive menu (default)
+
+Options:
+  --force                Non-interactive install (requires --domain)
+  --domain <name>        Domain for install
+  --app <jitsi>          App plugin (default: jitsi)
+  --auth <open|b|c>      Jitsi auth (default in --force: b)
+  --adopt                Reuse selfsteal nginx front
+  --standalone           New nginx front (default if no selfsteal)
+  --nginx                Ignored (realsteal always uses nginx)
+  --lang en|ru           UI language (default: ru)
+  --source <url>         Custom script URL for self-install
   --help|--version
 
+Examples:
+  bash <(curl -Ls ${UPDATE_URL}) @ install
+  bash <(curl -Ls ${UPDATE_URL}) @ --force --domain vpn.example.com install
+  bash <(curl -Ls ${UPDATE_URL}) @ --force --domain vpn.example.com --adopt install
+  realsteal menu
+  realsteal --lang en status
+
 Note: realsteal and selfsteal are mutually exclusive as active content front.
-      Only one Reality dest per domain/node.
 EOF
 }
 
@@ -1826,6 +1921,7 @@ menu_runtime_status() {
 
 main_menu() {
     detect_language
+    ensure_management_script
     while true; do
         clear
         state_load
@@ -1929,7 +2025,31 @@ main_menu() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --debug) DEBUG_MODE=true; set +e; shift ;;
-        --force) FORCE_MODE=true; shift ;;
+        --force|-f) FORCE_MODE=true; shift ;;
+        --domain)
+            if [ -n "${2:-}" ] && [[ ! "$2" =~ ^- ]]; then
+                FORCE_DOMAIN="$2"; shift 2
+            else
+                echo "Error: --domain requires a domain name" >&2; exit 1
+            fi ;;
+        --domain=*) FORCE_DOMAIN="${1#*=}"; shift ;;
+        --app)
+            if [ -n "${2:-}" ]; then FORCE_APP="$2"; shift 2
+            else echo "Error: --app requires a name" >&2; exit 1; fi ;;
+        --app=*) FORCE_APP="${1#*=}"; shift ;;
+        --auth)
+            if [ -n "${2:-}" ]; then FORCE_AUTH="$2"; shift 2
+            else echo "Error: --auth requires open|b|c" >&2; exit 1; fi ;;
+        --auth=*) FORCE_AUTH="${1#*=}"; shift ;;
+        --adopt) FORCE_FRONT_MODE="adopt"; shift ;;
+        --standalone) FORCE_FRONT_MODE="standalone"; shift ;;
+        --nginx) shift ;;  # compatibility alias; realsteal is nginx-only
+        --source)
+            if [ -n "${2:-}" ] && [[ "$2" =~ realsteal\.sh$ ]]; then
+                SCRIPT_URL="$2"; UPDATE_URL="$2"; shift 2
+            else
+                echo "Error: --source must be a URL to realsteal.sh" >&2; exit 1
+            fi ;;
         --lang)
             LANGUAGE="$2"; shift 2 ;;
         --lang=*) LANGUAGE="${1#*=}"; shift ;;

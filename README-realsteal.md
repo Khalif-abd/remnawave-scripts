@@ -66,7 +66,7 @@ sudo rm -rf /opt/realsteal/jitsi
 sudo realsteal install   # or: realsteal app install jitsi
 ```
 
-v1.0.1+ auto-detects invalid `docker-compose.yml` and re-fetches from upstream.
+v1.0.2+ uses `docker-compose.override.yml` with `!reset` instead of patching upstream yaml.
 
 ## Apps (plugin contract)
 

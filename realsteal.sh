@@ -6,9 +6,9 @@
 # ║  Project: gig.ovh                                              ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=1.0.1
+# VERSION=1.0.2
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Handle @ prefix for consistency with other scripts
@@ -802,6 +802,23 @@ app_jitsi_firewall_ports() {
     echo "10000/udp"
 }
 
+jitsi_bootstrap_needed() {
+    [ ! -f "$JITSI_DIR/docker-compose.yml" ] || \
+    [ ! -f "$JITSI_DIR/.env" ] || \
+    [ ! -f "$JITSI_DIR/gen-passwords.sh" ]
+}
+
+jitsi_bootstrap_repo() {
+    log_info "Cloning docker-jitsi-meet..."
+    rm -rf "$JITSI_DIR/src" 2>/dev/null || true
+    git clone --depth 1 https://github.com/jitsi/docker-jitsi-meet "$JITSI_DIR/src" 2>/dev/null || return 1
+    cp "$JITSI_DIR/src/docker-compose.yml" "$JITSI_DIR/docker-compose.yml"
+    cp "$JITSI_DIR/src/env.example" "$JITSI_DIR/.env"
+    cp "$JITSI_DIR/src/gen-passwords.sh" "$JITSI_DIR/"
+    chmod +x "$JITSI_DIR/gen-passwords.sh"
+    return 0
+}
+
 jitsi_restore_compose() {
     if [ -f "$JITSI_DIR/src/docker-compose.yml" ]; then
         cp "$JITSI_DIR/src/docker-compose.yml" "$JITSI_DIR/docker-compose.yml"
@@ -813,60 +830,72 @@ jitsi_restore_compose() {
 }
 
 jitsi_compose_valid() {
-    [ -f "$JITSI_DIR/docker-compose.yml" ] && (cd "$JITSI_DIR" && docker compose config >/dev/null 2>&1)
+    [ -f "$JITSI_DIR/docker-compose.yml" ] && [ -f "$JITSI_DIR/.env" ] || return 1
+    (cd "$JITSI_DIR" && docker compose config >/dev/null 2>&1)
 }
 
-jitsi_patch_compose_ports() {
-    local file="$JITSI_DIR/docker-compose.yml"
-    [ -f "$file" ] || return 1
+# Loopback-only web port: override with !reset (Compose v2.20+).
+# Never awk-patch the upstream docker-compose.yml — that corrupts YAML.
+jitsi_write_compose_override() {
+    cat > "$JITSI_DIR/docker-compose.override.yml" << 'EOF'
+services:
+  web:
+    ports: !reset
+      - "127.0.0.1:${HTTP_PORT}:80"
+EOF
+}
 
-    # Jitsi upstream: web.ports uses '${HTTP_PORT}:80' and '${HTTPS_PORT}:443'.
-    # Bind web on loopback only; drop HTTPS (TLS at nginx front).
-    awk '
-        BEGIN { in_web=0; drop_port_lines=0; web_ind=0 }
-        /^[[:space:]]*web:[[:space:]]*($|#)/ {
-            in_web=1
-            match($0, /^[[:space:]]*/)
-            web_ind=RLENGTH
-            print
-            next
-        }
-        in_web && match($0, /^[[:space:]]*/) && RLENGTH == web_ind && $0 ~ /^[[:space:]]*[a-zA-Z0-9_-]+:/ && $0 !~ /web:/ {
-            in_web=0
-        }
-        in_web && /^[[:space:]]*ports:[[:space:]]*($|#)/ {
-            print
-            match($0, /^[[:space:]]*/)
-            pad=sprintf("%*s", RLENGTH+4, "")
-            print pad "- '\''127.0.0.1:${HTTP_PORT}:80'\''"
-            drop_port_lines=2
-            next
-        }
-        drop_port_lines > 0 && /^[[:space:]]+- / { drop_port_lines--; next }
-        { print }
-    ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+jitsi_patch_compose_ports_python() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$JITSI_DIR/docker-compose.yml" << 'PY'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+out, in_web, web_ind, mode = [], False, 0, "normal"
+for line in lines:
+    stripped = line.lstrip()
+    indent = len(line) - len(stripped)
+    if stripped.startswith("web:") and stripped.split()[0] == "web:":
+        in_web, mode = True, "normal"
+        web_ind = indent
+        out.append(line)
+        continue
+    if in_web and indent == web_ind and stripped and stripped[0].isalpha() and stripped.split(":")[0] + ":" != "web:":
+        in_web, mode = False, "normal"
+    if in_web and stripped.startswith("ports:"):
+        out.append(line)
+        pad = " " * (indent + 4)
+        out.append(f"{pad}- '127.0.0.1:${{HTTP_PORT}}:80'\n")
+        mode = "drop_ports"
+        continue
+    if mode == "drop_ports":
+        if stripped.startswith("- "):
+            continue
+        mode = "normal"
+    out.append(line)
+with open(path, "w") as f:
+    f.writelines(out)
+PY
+}
 
-    if ! jitsi_compose_valid; then
-        log_warning "Compose patch failed validation — restoring upstream and retrying..."
-        jitsi_restore_compose || return 1
-        awk '
-            BEGIN { in_web=0; drop_port_lines=0; web_ind=0 }
-            /^[[:space:]]*web:[[:space:]]*($|#)/ {
-                in_web=1; match($0, /^[[:space:]]*/); web_ind=RLENGTH; print; next
-            }
-            in_web && match($0, /^[[:space:]]*/) && RLENGTH == web_ind && $0 ~ /^[[:space:]]*[a-zA-Z0-9_-]+:/ && $0 !~ /web:/ { in_web=0 }
-            in_web && /^[[:space:]]*ports:[[:space:]]*($|#)/ {
-                print; match($0, /^[[:space:]]*/); pad=sprintf("%*s", RLENGTH+4, "")
-                print pad "- '\''127.0.0.1:${HTTP_PORT}:80'\''"; drop_port_lines=2; next
-            }
-            drop_port_lines > 0 && /^[[:space:]]+- / { drop_port_lines--; next }
-            { print }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+jitsi_setup_compose_ports() {
+    jitsi_restore_compose || return 1
+    rm -f "$JITSI_DIR/docker-compose.override.yml"
+
+    jitsi_write_compose_override
+    if jitsi_compose_valid; then
+        return 0
     fi
 
+    log_warning "!reset override unsupported — patching compose with python3..."
+    rm -f "$JITSI_DIR/docker-compose.override.yml"
+    jitsi_restore_compose || return 1
+    jitsi_patch_compose_ports_python || return 1
+
     if ! jitsi_compose_valid; then
-        log_error "docker-compose.yml is invalid after port patch"
-        (cd "$JITSI_DIR" && docker compose config 2>&1 | tail -8) || true
+        log_error "docker-compose.yml is invalid"
+        (cd "$JITSI_DIR" && docker compose config 2>&1 | tail -10) || true
         return 1
     fi
     return 0
@@ -947,14 +976,8 @@ app_jitsi_install() {
     AUTH_MODE="$auth_mode"
 
     create_dir_safe "$JITSI_DIR"
-    if [ ! -f "$JITSI_DIR/docker-compose.yml" ] || ! jitsi_compose_valid 2>/dev/null; then
-        log_info "Cloning docker-jitsi-meet..."
-        rm -rf "$JITSI_DIR/src" 2>/dev/null || true
-        git clone --depth 1 https://github.com/jitsi/docker-jitsi-meet "$JITSI_DIR/src" 2>/dev/null || return 1
-        cp "$JITSI_DIR/src/docker-compose.yml" "$JITSI_DIR/"
-        cp "$JITSI_DIR/src/env.example" "$JITSI_DIR/.env"
-        cp "$JITSI_DIR/src/gen-passwords.sh" "$JITSI_DIR/"
-        chmod +x "$JITSI_DIR/gen-passwords.sh"
+    if jitsi_bootstrap_needed; then
+        jitsi_bootstrap_repo || return 1
     fi
 
     if ! grep -qE '^JICOFO_AUTH_PASSWORD=[^[:space:]]' "$JITSI_DIR/.env" 2>/dev/null; then
@@ -976,15 +999,15 @@ app_jitsi_install() {
 
     jitsi_apply_auth_env "$auth_mode"
 
-    # CONFIG directories
+    # CONFIG directories (required before docker compose config)
     local cfg_base="${HOME}/.jitsi-meet-cfg"
     for d in web transcripts prosody/config prosody/prosody-plugins-custom jicofo jvb jigasi jibri; do
         create_dir_safe "${cfg_base}/${d}"
     done
     env_set "$JITSI_DIR/.env" CONFIG "$cfg_base"
 
-    # Patch web ports — loopback only, remove 443
-    jitsi_patch_compose_ports || return 1
+    # Loopback web port — override or python fallback; never corrupt upstream yaml
+    jitsi_setup_compose_ports || return 1
 
     if port_in_use "${JITSI_HTTP_PORT}"; then
         if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q jitsi; then
@@ -1000,7 +1023,11 @@ app_jitsi_install() {
         [[ ! "$open_fw" =~ ^[Nn]$ ]] && open_firewall_port "$fw_port"
     }
 
-    (cd "$JITSI_DIR" && docker compose up -d) || return 1
+    (cd "$JITSI_DIR" && docker compose up -d) || {
+        log_error "docker compose up failed:"
+        (cd "$JITSI_DIR" && docker compose config 2>&1 | tail -12) || true
+        return 1
+    }
     log_success "$(t ok_app_installed jitsi)"
     return 0
 }

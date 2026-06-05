@@ -57,6 +57,17 @@ xver:     1
 serverNames: ["your.domain.com"]
 ```
 
+## Troubleshooting
+
+If Jitsi install failed with a YAML error, remove the broken tree and retry:
+
+```bash
+sudo rm -rf /opt/realsteal/jitsi
+sudo realsteal install   # or: realsteal app install jitsi
+```
+
+v1.0.1+ auto-detects invalid `docker-compose.yml` and re-fetches from upstream.
+
 ## Apps (plugin contract)
 
 | App | Status | Notes |

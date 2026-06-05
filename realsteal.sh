@@ -6,9 +6,9 @@
 # ║  Project: gig.ovh                                              ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=1.0.0
+# VERSION=1.0.1
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Handle @ prefix for consistency with other scripts
@@ -67,6 +67,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
+readonly PURPLE='\033[0;35m'
 readonly WHITE='\033[1;37m'
 readonly GRAY='\033[0;37m'
 readonly NC='\033[0m'
@@ -137,6 +138,21 @@ init_i18n() {
         [menu_guide]="Setup guide (Reality dest/serverNames)"
         [menu_uninstall]="Uninstall"
         [menu_exit]="Exit"
+        [menu_section_service]="Service Management"
+        [menu_section_app]="Applications"
+        [menu_section_ssl]="SSL & Guide"
+        [menu_section_maint]="Maintenance"
+        [menu_tip_install]="Tip: start with Install to set up front + Jitsi"
+        [menu_tip_running]="Tip: open https://%s in browser to verify the showcase app"
+        [menu_tip_stopped]="Tip: use Start services to bring everything up"
+        [menu_tip_error]="Tip: check logs if containers keep restarting"
+        [menu_select]="Select option [0-12]:"
+        [menu_press_enter]="Press Enter to continue..."
+        [label_status]="Status"
+        [label_version]="Version"
+        [auth_mode_open]="open"
+        [auth_mode_b]="secure B"
+        [auth_mode_c]="secure C"
         [guide_title]="Realsteal Setup Guide"
         [guide_reality_hint]="Configure in Remnawave panel — dest / serverNames"
         [firewall_warn]="Firewall may be blocking %s"
@@ -199,6 +215,21 @@ init_i18n() {
         [menu_guide]="Памятка Reality (dest/serverNames)"
         [menu_uninstall]="Удалить"
         [menu_exit]="Выход"
+        [menu_section_service]="Управление сервисами"
+        [menu_section_app]="Приложения"
+        [menu_section_ssl]="SSL и памятка"
+        [menu_section_maint]="Обслуживание"
+        [menu_tip_install]="Подсказка: начните с «Установка» — фронт + Jitsi"
+        [menu_tip_running]="Подсказка: откройте https://%s — проверьте витрину"
+        [menu_tip_stopped]="Подсказка: «Запустить сервисы» поднимет всё"
+        [menu_tip_error]="Подсказка: смотрите логи, если контейнеры перезапускаются"
+        [menu_select]="Выберите пункт [0-12]:"
+        [menu_press_enter]="Нажмите Enter..."
+        [label_status]="Статус"
+        [label_version]="Версия"
+        [auth_mode_open]="open"
+        [auth_mode_b]="secure B"
+        [auth_mode_c]="secure C"
         [guide_title]="Памятка по настройке Realsteal"
         [guide_reality_hint]="Настройте в панели Remnawave — dest / serverNames"
         [firewall_warn]="Firewall может блокировать %s"
@@ -771,25 +802,74 @@ app_jitsi_firewall_ports() {
     echo "10000/udp"
 }
 
+jitsi_restore_compose() {
+    if [ -f "$JITSI_DIR/src/docker-compose.yml" ]; then
+        cp "$JITSI_DIR/src/docker-compose.yml" "$JITSI_DIR/docker-compose.yml"
+        return 0
+    fi
+    log_info "Re-fetching docker-jitsi-meet compose..."
+    curl -fsSL "https://raw.githubusercontent.com/jitsi/docker-jitsi-meet/master/docker-compose.yml" \
+        -o "$JITSI_DIR/docker-compose.yml" 2>/dev/null
+}
+
+jitsi_compose_valid() {
+    [ -f "$JITSI_DIR/docker-compose.yml" ] && (cd "$JITSI_DIR" && docker compose config >/dev/null 2>&1)
+}
+
 jitsi_patch_compose_ports() {
     local file="$JITSI_DIR/docker-compose.yml"
-    local port="$JITSI_HTTP_PORT"
     [ -f "$file" ] || return 1
-    sed -i \
-        -e "/^[[:space:]]*- '443:443'/d" \
-        -e '/^[[:space:]]*- "443:443"/d' \
-        -e "s|^[[:space:]]*- '80:80'|      - '127.0.0.1:${port}:80'|" \
-        -e "s|^[[:space:]]*- \"80:80\"|      - '127.0.0.1:${port}:80'|" \
-        "$file"
-    if ! grep -q "127.0.0.1:${port}:80" "$file"; then
-        awk -v port="$port" '
-            /^[[:space:]]*web:/ { in_web=1 }
-            in_web && /^[[:space:]]*ports:/ { print; print "      - '\''127.0.0.1:" port ":80'\''"; skip=1; next }
-            skip && /^[[:space:]]+- / { next }
-            skip && /^[[:space:]]*[a-z]/ { skip=0; in_web=0 }
+
+    # Jitsi upstream: web.ports uses '${HTTP_PORT}:80' and '${HTTPS_PORT}:443'.
+    # Bind web on loopback only; drop HTTPS (TLS at nginx front).
+    awk '
+        BEGIN { in_web=0; drop_port_lines=0; web_ind=0 }
+        /^[[:space:]]*web:[[:space:]]*($|#)/ {
+            in_web=1
+            match($0, /^[[:space:]]*/)
+            web_ind=RLENGTH
+            print
+            next
+        }
+        in_web && match($0, /^[[:space:]]*/) && RLENGTH == web_ind && $0 ~ /^[[:space:]]*[a-zA-Z0-9_-]+:/ && $0 !~ /web:/ {
+            in_web=0
+        }
+        in_web && /^[[:space:]]*ports:[[:space:]]*($|#)/ {
+            print
+            match($0, /^[[:space:]]*/)
+            pad=sprintf("%*s", RLENGTH+4, "")
+            print pad "- '\''127.0.0.1:${HTTP_PORT}:80'\''"
+            drop_port_lines=2
+            next
+        }
+        drop_port_lines > 0 && /^[[:space:]]+- / { drop_port_lines--; next }
+        { print }
+    ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+
+    if ! jitsi_compose_valid; then
+        log_warning "Compose patch failed validation — restoring upstream and retrying..."
+        jitsi_restore_compose || return 1
+        awk '
+            BEGIN { in_web=0; drop_port_lines=0; web_ind=0 }
+            /^[[:space:]]*web:[[:space:]]*($|#)/ {
+                in_web=1; match($0, /^[[:space:]]*/); web_ind=RLENGTH; print; next
+            }
+            in_web && match($0, /^[[:space:]]*/) && RLENGTH == web_ind && $0 ~ /^[[:space:]]*[a-zA-Z0-9_-]+:/ && $0 !~ /web:/ { in_web=0 }
+            in_web && /^[[:space:]]*ports:[[:space:]]*($|#)/ {
+                print; match($0, /^[[:space:]]*/); pad=sprintf("%*s", RLENGTH+4, "")
+                print pad "- '\''127.0.0.1:${HTTP_PORT}:80'\''"; drop_port_lines=2; next
+            }
+            drop_port_lines > 0 && /^[[:space:]]+- / { drop_port_lines--; next }
             { print }
         ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
     fi
+
+    if ! jitsi_compose_valid; then
+        log_error "docker-compose.yml is invalid after port patch"
+        (cd "$JITSI_DIR" && docker compose config 2>&1 | tail -8) || true
+        return 1
+    fi
+    return 0
 }
 
 app_jitsi_nginx_locations() {
@@ -867,8 +947,9 @@ app_jitsi_install() {
     AUTH_MODE="$auth_mode"
 
     create_dir_safe "$JITSI_DIR"
-    if [ ! -f "$JITSI_DIR/docker-compose.yml" ]; then
+    if [ ! -f "$JITSI_DIR/docker-compose.yml" ] || ! jitsi_compose_valid 2>/dev/null; then
         log_info "Cloning docker-jitsi-meet..."
+        rm -rf "$JITSI_DIR/src" 2>/dev/null || true
         git clone --depth 1 https://github.com/jitsi/docker-jitsi-meet "$JITSI_DIR/src" 2>/dev/null || return 1
         cp "$JITSI_DIR/src/docker-compose.yml" "$JITSI_DIR/"
         cp "$JITSI_DIR/src/env.example" "$JITSI_DIR/.env"
@@ -903,7 +984,7 @@ app_jitsi_install() {
     env_set "$JITSI_DIR/.env" CONFIG "$cfg_base"
 
     # Patch web ports — loopback only, remove 443
-    jitsi_patch_compose_ports
+    jitsi_patch_compose_ports || return 1
 
     if port_in_use "${JITSI_HTTP_PORT}"; then
         if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q jitsi; then
@@ -1667,54 +1748,152 @@ Note: realsteal and selfsteal are mutually exclusive as active content front.
 EOF
 }
 
+menu_runtime_status() {
+    local front_state="not_installed"
+    local front_color="$GRAY"
+    local app_state="not_installed"
+    local app_color="$GRAY"
+
+    if [ -n "$DOMAIN" ] && [ -f "$STATE_FILE" ]; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+            local health
+            health=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
+            case "$health" in
+                running) front_state="$(t status_running)"; front_color="$GREEN" ;;
+                restarting) front_state="Error (restarting)"; front_color="$YELLOW" ;;
+                *) front_state="$(t status_stopped)"; front_color="$RED" ;;
+            esac
+        else
+            front_state="$(t status_stopped)"
+            front_color="$RED"
+        fi
+
+        case "$ACTIVE_APP" in
+            jitsi)
+                if [ -d "$JITSI_DIR" ]; then
+                    local jitsi_up
+                    jitsi_up=$(cd "$JITSI_DIR" && docker compose ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
+                    if [ "${jitsi_up:-0}" -ge 3 ]; then
+                        app_state="$(t status_running) (${jitsi_up} containers)"
+                        app_color="$GREEN"
+                    elif [ "${jitsi_up:-0}" -gt 0 ]; then
+                        app_state="Partial (${jitsi_up}/4)"
+                        app_color="$YELLOW"
+                    else
+                        app_state="$(t status_stopped)"
+                        app_color="$RED"
+                    fi
+                fi
+                ;;
+            *)
+                [ -n "$ACTIVE_APP" ] && app_state="$ACTIVE_APP"
+                ;;
+        esac
+    fi
+
+    FRONT_STATUS="$front_state"
+    FRONT_STATUS_COLOR="$front_color"
+    APP_STATUS="$app_state"
+    APP_STATUS_COLOR="$app_color"
+}
+
 main_menu() {
     detect_language
     while true; do
         clear
-        echo -e "${WHITE}🔗 $(t menu_title)${NC} v${SCRIPT_VERSION}"
-        echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
         state_load
+        menu_runtime_status
+
+        echo -e "${WHITE}🎭 $(t menu_title)${NC}"
+        echo -e "${GRAY}$(t label_version): ${SCRIPT_VERSION}${NC}  ${CYAN}|  realsteal + Reality${NC}"
+        echo -e "${GRAY}$(printf '─%.0s' $(seq 1 52))${NC}"
+        echo
+
         if [ -n "$DOMAIN" ]; then
-            printf "   %-12s %s\n" "$(t label_domain):" "$DOMAIN"
-            printf "   %-12s %s / %s\n" "$(t label_active_app):" "${ACTIVE_APP:-—}" "${FRONT_MODE:-—}"
+            case "$FRONT_STATUS" in
+                *"$(t status_running)"*|Running*) echo -e "${FRONT_STATUS_COLOR}✅ $(t label_status): ${FRONT_STATUS}${NC}" ;;
+                *Error*) echo -e "${FRONT_STATUS_COLOR}⚠️  $(t label_status): ${FRONT_STATUS}${NC}" ;;
+                *"$(t status_stopped)"*|Stopped*) echo -e "${FRONT_STATUS_COLOR}⏹️  $(t label_status): ${FRONT_STATUS}${NC}" ;;
+                *) echo -e "${GRAY}📦 $(t label_status): ${FRONT_STATUS}${NC}" ;;
+            esac
+            echo
+            printf "   ${WHITE}%-14s${NC} ${CYAN}%s${NC}\n" "$(t label_domain):" "$DOMAIN"
+            printf "   ${WHITE}%-14s${NC} ${GRAY}%s${NC} (${FRONT_TYPE:-socket})\n" "$(t label_front_mode):" "${FRONT_MODE:-—}"
+            printf "   ${WHITE}%-14s${NC} ${PURPLE}%s${NC}\n" "$(t label_active_app):" "${ACTIVE_APP:-—}"
+            [ -n "$ACTIVE_APP" ] && printf "   ${WHITE}%-14s${NC} ${APP_STATUS_COLOR}%s${NC}\n" "App:" "$APP_STATUS"
+            [ "$ACTIVE_APP" = "jitsi" ] && [ -n "$AUTH_MODE" ] && \
+                printf "   ${WHITE}%-14s${NC} ${GRAY}%s${NC}\n" "$(t label_auth):" "$AUTH_MODE"
+            echo
         else
-            echo "   $(t status_not_installed)"
+            echo -e "${GRAY}📦 $(t status_not_installed)${NC}"
+            echo
+        fi
+
+        echo -e "${WHITE}🔧 $(t menu_section_service):${NC}"
+        echo -e "   ${WHITE} 1)${NC} 🚀 $(t menu_install)"
+        echo -e "   ${WHITE} 2)${NC} ▶️  $(t menu_up)"
+        echo -e "   ${WHITE} 3)${NC} ⏹️  $(t menu_down)"
+        echo -e "   ${WHITE} 4)${NC} 🔄 $(t menu_restart)"
+        echo -e "   ${WHITE} 5)${NC} 📊 $(t menu_status)"
+        echo -e "   ${WHITE} 6)${NC} 📝 $(t menu_logs)"
+        echo
+        echo -e "${WHITE}📱 $(t menu_section_app):${NC}"
+        echo -e "   ${WHITE} 7)${NC} 🎯 $(t menu_app)"
+        echo -e "   ${WHITE} 8)${NC} 🔐 $(t menu_auth) ${GRAY}(jitsi)${NC}"
+        echo -e "   ${WHITE} 9)${NC} 👤 $(t menu_users) ${GRAY}(jitsi)${NC}"
+        echo
+        echo -e "${WHITE}🔐 $(t menu_section_ssl):${NC}"
+        echo -e "   ${WHITE}10)${NC} 📜 $(t menu_renew_ssl)"
+        echo -e "   ${WHITE}11)${NC} 📖 $(t menu_guide)"
+        echo
+        echo -e "${WHITE}🗑️  $(t menu_section_maint):${NC}"
+        echo -e "   ${WHITE}12)${NC} 🗑️  $(t menu_uninstall)"
+        echo -e "   ${GRAY} 0)${NC} ⬅️  $(t menu_exit)"
+        echo
+
+        if [ -z "$DOMAIN" ]; then
+            echo -e "${BLUE}💡 $(t menu_tip_install)${NC}"
+        elif [[ "$FRONT_STATUS" == *"$(t status_running)"* ]] || [[ "$FRONT_STATUS" == *Running* ]]; then
+            echo -e "${BLUE}💡 $(t menu_tip_running "$DOMAIN")${NC}"
+        elif [[ "$FRONT_STATUS" == *Error* ]]; then
+            echo -e "${BLUE}💡 $(t menu_tip_error)${NC}"
+        else
+            echo -e "${BLUE}💡 $(t menu_tip_stopped)${NC}"
         fi
         echo
-        echo "  1) $(t menu_install)"
-        echo "  2) $(t menu_up)"
-        echo "  3) $(t menu_down)"
-        echo "  4) $(t menu_restart)"
-        echo "  5) $(t menu_status)"
-        echo "  6) $(t menu_logs)"
-        echo "  7) $(t menu_app)"
-        echo "  8) $(t menu_auth)"
-        echo "  9) $(t menu_users)"
-        echo " 10) $(t menu_renew_ssl)"
-        echo " 11) $(t menu_guide)"
-        echo " 12) $(t menu_uninstall)"
-        echo "  0) $(t menu_exit)"
-        echo
-        read -r -p "Choice: " choice
+
+        read -r -p "$(echo -e "${WHITE}$(t menu_select)${NC} ")" choice
+
         case "$choice" in
-            1) install_command; read -r -p "Enter..." _ ;;
-            2) up_command; read -r -p "Enter..." _ ;;
-            3) down_command; read -r -p "Enter..." _ ;;
-            4) restart_command; read -r -p "Enter..." _ ;;
-            5) status_command; read -r -p "Enter..." _ ;;
-            6) logs_command; ;;
-            7) app_list_command; read -r -p "Enter..." _ ;;
-            8)
-                echo "  1) open  2) b  3) c"
-                read -r -p "Auth mode: " am
-                case "$am" in 1) auth_command open ;; 3) auth_command c ;; *) auth_command b ;; esac
-                read -r -p "Enter..." _
+            1) install_command; read -r -p "$(t menu_press_enter)" _ ;;
+            2) up_command; read -r -p "$(t menu_press_enter)" _ ;;
+            3) down_command; read -r -p "$(t menu_press_enter)" _ ;;
+            4) restart_command; read -r -p "$(t menu_press_enter)" _ ;;
+            5) status_command; read -r -p "$(t menu_press_enter)" _ ;;
+            6) logs_command ;;
+            7)
+                app_list_command
+                echo
+                echo -e "${GRAY}  switch: realsteal app switch <name>${NC}"
+                read -r -p "$(t menu_press_enter)" _
                 ;;
-            9) user_command list; read -r -p "Enter..." _ ;;
-            10) renew_ssl_command; read -r -p "Enter..." _ ;;
+            8)
+                echo -e "${WHITE}  1)${NC} $(t prompt_auth_open)"
+                echo -e "${WHITE}  2)${NC} $(t prompt_auth_b)"
+                echo -e "${WHITE}  3)${NC} $(t prompt_auth_c)"
+                read -r -p "Choice [2]: " am
+                case "$am" in 1) auth_command open ;; 3) auth_command c ;; *) auth_command b ;; esac
+                read -r -p "$(t menu_press_enter)" _
+                ;;
+            9) user_command list; read -r -p "$(t menu_press_enter)" _ ;;
+            10) renew_ssl_command; read -r -p "$(t menu_press_enter)" _ ;;
             11) guide_command ;;
-            12) uninstall_command; read -r -p "Enter..." _ ;;
-            0) exit 0 ;;
+            12) uninstall_command; read -r -p "$(t menu_press_enter)" _ ;;
+            0) clear; exit 0 ;;
+            *)
+                echo -e "${RED}❌ ?${NC}"
+                sleep 1
+                ;;
         esac
     done
 }

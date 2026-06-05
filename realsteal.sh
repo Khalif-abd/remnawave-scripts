@@ -6,25 +6,50 @@
 # ║  Project: gig.ovh                                              ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=1.0.4
+# VERSION=1.0.5
 
-SCRIPT_VERSION="1.0.4"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_VERSION="1.0.5"
+
+# Always print first (even if later steps fail). If you see nothing — curl delivered 0 bytes.
+echo "▶ Realsteal v${SCRIPT_VERSION} (bash ${BASH_VERSION})" >&2
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
     shift
 fi
 
-# Note: sudo bash <(curl …) fails — /dev/fd/N is not visible inside sudo. Use: curl … | bash -s --
+# Strip CR from args (Windows-edited scripts / copy-paste)
+if [ $# -gt 0 ]; then
+    _rs_args=()
+    for _rs_a in "$@"; do
+        _rs_args+=("${_rs_a//$'\r'/}")
+    done
+    set -- "${_rs_args[@]}"
+    unset _rs_a _rs_args
+fi
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    echo "ERROR: bash 4+ required (found: ${BASH_VERSION})" >&2
+    exit 1
+fi
+
+# Note: sudo bash <(curl …) fails — use: curl -fsSL URL -o /tmp/realsteal.sh && bash /tmp/realsteal.sh …
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /tmp)"
 
 # ── Globals ──────────────────────────────────────────────────────
 APP_NAME="realsteal"
 REALSTEAL_DIR="/opt/realsteal"
 STATE_FILE="$REALSTEAL_DIR/realsteal.env"
 LOG_FILE="/var/log/realsteal.log"
+# Log path: use /var/log as root, else /tmp (avoid silent failures)
+if [ "$(id -u)" -eq 0 ]; then
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/realsteal.log"
+else
+    LOG_FILE="/tmp/realsteal.log"
+fi
 SCRIPT_URL="https://raw.githubusercontent.com/Khalif-abd/remnawave-scripts/main/realsteal.sh"
 UPDATE_URL="$SCRIPT_URL"
 
@@ -1476,9 +1501,39 @@ ensure_management_script() {
     [ "${EUID:-$(id -u)}" -eq 0 ] && install_management_script
 }
 
+doctor_command() {
+    echo "=== Realsteal doctor v${SCRIPT_VERSION} ==="
+    echo "bash: ${BASH_VERSION} ($(command -v bash))"
+    echo "uid: $(id -u)  home: ${HOME}"
+    echo
+    echo "Stale copies (safe to rm -f):"
+    for f in /realsteal.sh /root/realsteal.sh ./realsteal.sh; do
+        [ -f "$f" ] && echo "  FOUND $f ($(wc -c < "$f") bytes)" || true
+    done
+    echo "  /usr/local/bin/realsteal: $([ -x /usr/local/bin/realsteal ] && echo yes || echo no)"
+    [ -x /usr/local/bin/realsteal ] && head -1 /usr/local/bin/realsteal || true
+    echo
+    echo "Install state:"
+    [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "  (not installed)"
+    echo
+    echo "curl test → ${UPDATE_URL}"
+    local tmp="/tmp/realsteal-doctor-$$.sh"
+    if curl -fsSL "$UPDATE_URL" -o "$tmp" 2>/dev/null; then
+        echo "  OK: $(wc -c < "$tmp") bytes, version: $(grep '^# VERSION=' "$tmp" | head -1 || echo '?')"
+        rm -f "$tmp"
+    else
+        echo "  FAIL: curl exit $?"
+        echo "  Use: curl -fsSL URL -o /tmp/realsteal.sh && bash /tmp/realsteal.sh @ install"
+    fi
+    echo
+    echo "Recommended install (not pipe — shows curl errors):"
+    echo "  curl -fsSL ${UPDATE_URL} -o /tmp/realsteal.sh && bash /tmp/realsteal.sh @ --force --domain YOUR_DOMAIN install"
+}
+
 # ── Commands ─────────────────────────────────────────────────────
 install_command() {
     check_running_as_root
+    ensure_management_script
     log_info "$(t info_installing)"
 
     if [ "$FORCE_MODE" = true ] && [ -z "$FORCE_DOMAIN" ]; then
@@ -1836,19 +1891,19 @@ $(t menu_title) v${SCRIPT_VERSION}
 
 Usage: $APP_NAME [options] <command> [args]
 
-Remote one-liner (works with sudo — do NOT use bash <(curl …) with sudo):
+Remote install (recommended — download first, NOT pipe):
 
-  $(curl_install_pipe) @ --force --domain reality.example.com install
+  curl -fsSL ${UPDATE_URL} -o /tmp/realsteal.sh && \\
+    bash /tmp/realsteal.sh @ --force --domain reality.example.com install
 
-  # already root:
-  curl -fsSL ${UPDATE_URL} | bash -s -- @ --force --domain reality.example.com install
+  If you see NO output with "curl | bash", curl failed silently — use the command above.
 
-  # via sudo:
-  curl -fsSL ${UPDATE_URL} | sudo bash -s -- @ --force --domain reality.example.com install
+  Pipe (only if curl works): $(curl_install_pipe) @ --force --domain DOMAIN install
 
 After install use: realsteal menu | realsteal status | realsteal
 
 Commands:
+  doctor                 Diagnose curl / stale scripts / install state
   install              Interactive or --force install (front + app)
   up|down|restart        Lifecycle front + app
   status|logs [app]      Status and logs
@@ -2079,6 +2134,7 @@ detect_language
 state_load
 
 case "${COMMAND:-}" in
+    doctor) doctor_command ;;
     install) install_command ;;
     up) up_command ;;
     down) down_command ;;

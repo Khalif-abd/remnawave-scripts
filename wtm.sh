@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WARP & Tor Network Setup Script
 # This script installs and manages Cloudflare WARP and Tor connections
-# VERSION=1.4.0
+# VERSION=1.4.1
 
 # NB: this is an interactive, status-returning menu script. We deliberately do
 # NOT use `set -e` (errexit): many functions return non-zero as a normal status
@@ -9,7 +9,7 @@
 # break the menu loop. We keep `set -E` (errtrace) so the ERR trap below can
 # surface genuinely unexpected failures for diagnostics without exiting.
 set -E
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Error handler for debugging (diagnostic only — never exits)
@@ -740,6 +740,13 @@ generate_warp_xray_outbound() {
 
     # reserved [0,0,0] works for the generic endpoint. Some Cloudflare PoPs need
     # the account-specific value (from `wgcf-cli generate --xray` or warp-reg).
+    #
+    # noKernelTun=true forces the userspace (gVisor) stack. With the default
+    # (false) Xray only checks CAP_NET_ADMIN and then tries to create a kernel
+    # TUN device + write rp_filter sysctls; in containers with a read-only
+    # /proc/sys that write fails FATALLY (no runtime fallback to userspace),
+    # taking the whole outbound down. Userspace works everywhere; on a bare
+    # host you may flip it to false for kernel-TUN performance.
     cat > "$WARP_XRAY_FILE" <<EOF
 {
   "tag": "warp",
@@ -756,7 +763,7 @@ generate_warp_xray_outbound() {
     ],
     "reserved": [0, 0, 0],
     "mtu": 1280,
-    "noKernelTun": false
+    "noKernelTun": true
   }
 }
 EOF
@@ -1756,14 +1763,17 @@ show_xray_config_page() {
       }
     ],
     "reserved": [0, 0, 0],
-    "mtu": 1280
+    "mtu": 1280,
+    "noKernelTun": true
   }
 }
 EOF
         printf "${NC}\n\n"
     fi
 
-    printf "${YELLOW}• In Docker / read-only or unprivileged hosts add  \"noKernelTun\": true${NC}\n"
+    printf "${YELLOW}• \"noKernelTun\": true (default here) = userspace stack — works in${NC}\n"
+    printf "${YELLOW}  Docker/LXC and on read-only /proc/sys. On a bare host with${NC}\n"
+    printf "${YELLOW}  CAP_NET_ADMIN you may set it to false for faster kernel TUN.${NC}\n"
     printf "${YELLOW}• Some Cloudflare PoPs need a real \"reserved\" — get it from${NC}\n"
     printf "${YELLOW}  'wgcf-cli generate --xray' or the warp-reg one-liner${NC}\n\n"
 
@@ -1785,7 +1795,8 @@ EOF
             "endpoint": "engage.cloudflareclient.com:2408"
           }
         ],
-        "reserved": [0, 0, 0]
+        "reserved": [0, 0, 0],
+        "noKernelTun": true
       }
     },
     {

@@ -1,8 +1,10 @@
-# 🌐 WTM - WARP & Tor Manager v1.4.0 - Профессиональное управление анонимными сетями
+# 🌐 WTM - WARP & Tor Manager v1.4.1 - Профессиональное управление анонимными сетями
 
 **WTM** - это комплексный bash-скрипт для автоматизации установки и управления **Cloudflare WARP** и **Tor** на Linux серверах.
 
-🆕 **Версия v1.4.0** — современная интеграция WARP в ядро **Xray** через нативный `wireguard` outbound, безопасное самообновление, исправление опасного апгрейда ОС и крупный рефакторинг.
+🆕 **Версия v1.4.1** — безопасный дефолт `"noKernelTun": true` в генерируемом Xray-outbound: конфиг работает «из коробки» в Docker и других контейнерах.
+
+**v1.4.0** — современная интеграция WARP в ядро **Xray** через нативный `wireguard` outbound, безопасное самообновление, исправление опасного апгрейда ОС и крупный рефакторинг.
 
 ### Релиз от проектов [GIG.ovh](https://gig.ovh) и [OpeNode.xyz](https://openode.xyz)
 
@@ -24,6 +26,10 @@
 - **Глобальная установка** в `/usr/local/bin/wtm` для системного доступа
 - **Логирование действий** в `/var/log/wtm.log`
 - **Полноценная CLI справка** `wtm --help`
+
+## 💾 Изменения в v1.4.1
+
+- **`"noKernelTun": true` по умолчанию** в генерируемом `/etc/wireguard/warp-xray-outbound.json` и во всех примерах. При дефолтном `false` Xray проверяет только `CAP_NET_ADMIN` и пытается создать kernel-TUN с записью `rp_filter` в `/proc/sys` — в контейнере с read-only `/proc/sys` (типичный Docker, включая remnanode) запись падает **фатально, без отката на userspace**, и весь outbound не стартует. Userspace-стек (gVisor) работает везде; на голом хосте с `CAP_NET_ADMIN` можно вручную поставить `false` ради производительности kernel-TUN.
 
 ## 💾 Изменения в v1.4.0
 
@@ -244,7 +250,7 @@ sudo wtm self-update
 ### 🖥️ Главное меню
 
 ```
-🌐 WARP & Tor Manager v1.4.0
+🌐 WARP & Tor Manager v1.4.1
 ──────────────────────────────────────────────────
 
 🛠️  Service Management:
@@ -355,12 +361,13 @@ socks5 127.0.0.1 9050
       }
     ],
     "reserved": [0, 0, 0],
-    "mtu": 1280
+    "mtu": 1280,
+    "noKernelTun": true
   }
 }
 ```
 
-- В Docker / на read-only или непривилегированных хостах добавьте `"noKernelTun": true`.
+- `"noKernelTun": true` (генерируется по умолчанию, 🆕 v1.4.1) — userspace-стек, работает в Docker/LXC и на read-only `/proc/sys`. На голом хосте с `CAP_NET_ADMIN` можно поставить `false` — kernel-TUN быстрее.
 - Для отдельных PoP Cloudflare нужен реальный `reserved` (из `wgcf-cli generate --xray` или `warp-reg`).
 - На `wireguard` outbound **нельзя** вешать `streamSettings`/`sockopt`; для цепочки используйте `dialerProxy` на другом outbound.
 
@@ -382,7 +389,8 @@ socks5 127.0.0.1 9050
             "endpoint": "engage.cloudflareclient.com:2408"
           }
         ],
-        "reserved": [0, 0, 0]
+        "reserved": [0, 0, 0],
+        "noKernelTun": true
       }
     },
     {
@@ -529,7 +537,7 @@ sudo wtm system-info
 
 ---
 
-**Версия**: v1.4.0  
-**Последнее обновление**: 29 июня 2026  
+**Версия**: v1.4.1  
+**Последнее обновление**: 4 июля 2026  
 **Автор**: DigneZzZ  
 **Проект**: [https://gig.ovh](https://gig.ovh)

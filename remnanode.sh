@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Version: 4.3.3
+# Version: 4.3.7
 set -e
-SCRIPT_VERSION="4.3.3"
+SCRIPT_VERSION="4.3.7"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -516,10 +516,23 @@ install_latest_xray_core() {
     mkdir -p "$DATA_DIR"
     cd "$DATA_DIR"
     
-    latest_release=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep -oP '"tag_name": "\K(.*?)(?=")')
+    # Fetch the newest release INCLUDING pre-releases.
+    # GitHub's /releases/latest endpoint returns only the newest *stable* release, but
+    # the current node build requires the pre-release Xray-core. The /releases list is
+    # ordered newest-first and includes pre-releases, so we take its first entry.
+    local release_json
+    release_json=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1") || true
+    latest_release=$(echo "$release_json" | grep -oP '"tag_name":\s*"\K(.*?)(?=")' | head -n1) || true
+    local is_prerelease
+    is_prerelease=$(echo "$release_json" | grep -oP '"prerelease":\s*\K(true|false)' | head -n1) || true
+
     if [ -z "$latest_release" ]; then
         colorized_echo red "Failed to fetch latest Xray-core version."
         exit 1
+    fi
+
+    if [ "$is_prerelease" = "true" ]; then
+        colorized_echo yellow "⚠️  Newest Xray-core is a pre-release: ${latest_release}"
     fi
     
     if ! dpkg -s unzip >/dev/null 2>&1; then
@@ -560,7 +573,7 @@ install_latest_xray_core() {
         colorized_echo green "  ✅ geosite.dat"
     fi
     
-    colorized_echo green "Latest Xray-core (${latest_release}) installed at $XRAY_FILE"
+    colorized_echo green "Xray-core (${latest_release}) installed at $XRAY_FILE"
 }
 
 setup_log_rotation() {
@@ -1049,22 +1062,18 @@ install_remnanode() {
     fi
     echo
 
-    # Ask about installing Xray-core
+    # Install Xray-core only when explicitly requested via --xray.
+    # We no longer prompt for it during installation: the "latest" stable Xray-core
+    # is currently incompatible with the newest node (only the pre-release build works),
+    # so installing the stable release here would be useless.
     INSTALL_XRAY=false
     if [ "$FORCE_INSTALL_XRAY" == "true" ]; then
         colorized_echo green "✅ Installing Xray-core (--xray flag)"
         INSTALL_XRAY=true
         install_latest_xray_core
-    elif [ "$FORCE_INSTALL_XRAY" == "false" ] || [ "$FORCE_MODE" == "true" ]; then
-        # Force mode defaults to NOT installing Xray-core
-        colorized_echo gray "ℹ️  Skipping Xray-core installation (use --xray to install)"
-        INSTALL_XRAY=false
     else
-        read -p "Do you want to install the latest version of Xray-core? (y/n): " -r install_xray
-        if [[ "$install_xray" =~ ^[Yy]$ ]]; then
-            INSTALL_XRAY=true
-            install_latest_xray_core
-        fi
+        colorized_echo gray "ℹ️  Skipping Xray-core installation (use --xray flag, or run 'core-update' later to install)"
+        INSTALL_XRAY=false
     fi
 
     colorized_echo blue "Generating .env file"
@@ -1275,23 +1284,60 @@ follow_remnanode_logs() {
 }
 
 update_remnanode_script() {
+    local target_path="/usr/local/bin/$APP_NAME"
+
     # Получаем текущую версию перед обновлением
     local old_version="unknown"
-    if [ -f "/usr/local/bin/$APP_NAME" ]; then
-        old_version=$(grep "^SCRIPT_VERSION=" "/usr/local/bin/$APP_NAME" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [ -f "$target_path" ]; then
+        old_version=$(grep "^SCRIPT_VERSION=" "$target_path" 2>/dev/null | head -1 | cut -d'"' -f2)
         [ -z "$old_version" ] && old_version="unknown"
     fi
-    
+
     colorized_echo blue "Updating remnanode script (current: v$old_version)"
-    curl -sSL $SCRIPT_URL | install -m 755 /dev/stdin /usr/local/bin/$APP_NAME
-    
-    # Получаем новую версию после обновления
-    local new_version=$(grep "^SCRIPT_VERSION=" "/usr/local/bin/$APP_NAME" 2>/dev/null | head -1 | cut -d'"' -f2)
-    if [ -n "$new_version" ]; then
-        colorized_echo green "Remnanode script updated successfully: v$old_version → v$new_version"
-    else
-        colorized_echo green "Remnanode script updated successfully"
+
+    # Скачиваем во временный файл, а не через `curl | install /dev/stdin`:
+    # на минимальных системах /dev/stdin недоступен и install падает с
+    # "No such file or directory", curl получает ошибку 23, а файл остаётся
+    # старым — из-за чего вызывающий код зацикливался на обновлении.
+    local tmp_file
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX") || {
+        colorized_echo red "Failed to create temporary file"
+        return 1
+    }
+
+    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_file"; then
+        colorized_echo red "Failed to download script from $SCRIPT_URL"
+        rm -f "$tmp_file"
+        return 1
     fi
+
+    # Проверяем, что скачали валидный скрипт (shebang + версия)
+    local new_version
+    new_version=$(grep "^SCRIPT_VERSION=" "$tmp_file" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [ -z "$new_version" ] || ! head -n1 "$tmp_file" | grep -q '^#!'; then
+        colorized_echo red "Downloaded file is not a valid remnanode script — aborting update"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # Устанавливаем из обычного файла (без /dev/stdin)
+    if ! install -m 755 "$tmp_file" "$target_path"; then
+        colorized_echo red "Failed to install updated script to $target_path"
+        rm -f "$tmp_file"
+        return 1
+    fi
+    rm -f "$tmp_file"
+
+    # Проверяем, что версия на диске действительно сменилась
+    local installed_version
+    installed_version=$(grep "^SCRIPT_VERSION=" "$target_path" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [ "$installed_version" != "$new_version" ]; then
+        colorized_echo red "Script update verification failed (expected v$new_version, got v${installed_version:-unknown})"
+        return 1
+    fi
+
+    colorized_echo green "Remnanode script updated successfully: v$old_version → v$installed_version"
+    return 0
 }
 
 update_remnanode() {
@@ -2829,8 +2875,9 @@ get_current_xray_core_version() {
     # Сначала проверяем, примонтирован ли Xray в контейнер
     if is_xray_mounted && [ -f "$XRAY_FILE" ]; then
         # Xray примонтирован, получаем версию из локального файла
-        version_output=$("$XRAY_FILE" -version 2>/dev/null)
-        if [ $? -eq 0 ]; then
+        # Присваивание как условие if: при set -e «голое» version_output=$(...)
+        # с ненулевым кодом завершило бы скрипт до проверки [ $? -eq 0 ].
+        if version_output=$("$XRAY_FILE" -version 2>/dev/null); then
             version=$(echo "$version_output" | head -n1 | awk '{print $2}')
             echo "$version (external)"
             return 0
@@ -2871,7 +2918,10 @@ get_xray_core() {
         echo
         
         # Текущая версия
-        current_version=$(get_current_xray_core_version)
+        # || true: функция возвращает 1, когда Xray не установлен (контейнер
+        # остановлен / не примонтирован). Без защиты set -e (стр. 3) молча убил
+        # бы скрипт прямо здесь — баннер уже показан, а меню не появляется.
+        current_version=$(get_current_xray_core_version || true)
         echo -e "\033[1;37m🌐 Current Status:\033[0m"
         printf "   \033[38;5;15m%-15s\033[0m \033[38;5;250m%s\033[0m\n" "Xray Version:" "$current_version"
         printf "   \033[38;5;15m%-15s\033[0m \033[38;5;250m%s\033[0m\n" "Architecture:" "$ARCH"

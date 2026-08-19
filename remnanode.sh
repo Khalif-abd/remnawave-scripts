@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Version: 4.3.7
+# Version: 4.5.0
 set -e
-SCRIPT_VERSION="4.4.0"
+SCRIPT_VERSION="4.5.0"
+
+# Original invocation, captured before any shifting, so a self-update can
+# re-exec the new script with exactly the command the user typed.
+SCRIPT_ORIGINAL_ARGS=("$@")
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
-    shift  
+    shift
 fi
 
 # Parse command line arguments
@@ -15,7 +19,22 @@ if [ $# -gt 0 ]; then
     shift
 fi
 
-SCRIPT_URL="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/remnanode.sh"
+# ============================================
+# Script delivery
+#
+# raw.githubusercontent.com is unreachable on a good share of the networks these
+# servers live on (blocked, DNS-poisoned or rate-limited), so every download
+# walks a mirror list and takes the first source that returns something which
+# actually parses as this script. jsDelivr serves the same git ref from several
+# independent CDNs; it is only a fallback because a branch ref can be cached
+# there for up to ~12h, while raw.githubusercontent is always current.
+# ============================================
+SCRIPT_REPO="DigneZzZ/remnawave-scripts"
+SCRIPT_REF="main"
+SCRIPT_FILE="remnanode.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/${SCRIPT_REPO}/${SCRIPT_REF}/${SCRIPT_FILE}"
+SCRIPT_URL_OVERRIDDEN="false"   # set by --source
+SCRIPT_SOURCE_USED=""           # mirror the last successful download came from
 
 # ============================================
 # Force mode variables (for non-interactive installation)
@@ -159,29 +178,29 @@ while [[ $# -gt 0 ]]; do
             shift # past argument
         ;;
         --tag|--version|--node-version)
-            if [[ "$COMMAND" == "install" ]]; then
+            if [[ "$COMMAND" == "install" || "$COMMAND" == "update" ]]; then
                 if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
                     NODE_IMAGE_TAG="$2"
                     shift 2
                 else
-                    echo "Error: --tag requires a value (e.g. --tag 2.8.0)."
+                    echo "Error: --tag requires a value (e.g. --tag 3.2.2)."
                     exit 1
                 fi
             else
-                echo "Error: --tag parameter is only allowed with 'install' command."
+                echo "Error: --tag parameter is only allowed with 'install' or 'update' commands."
                 exit 1
             fi
         ;;
         --tag=*|--version=*|--node-version=*)
-            if [[ "$COMMAND" == "install" ]]; then
+            if [[ "$COMMAND" == "install" || "$COMMAND" == "update" ]]; then
                 NODE_IMAGE_TAG="${1#*=}"
                 if [ -z "$NODE_IMAGE_TAG" ]; then
-                    echo "Error: --tag requires a value (e.g. --tag=2.8.0)."
+                    echo "Error: --tag requires a value (e.g. --tag=3.2.2)."
                     exit 1
                 fi
                 shift
             else
-                echo "Error: --tag parameter is only allowed with 'install' command."
+                echo "Error: --tag parameter is only allowed with 'install' or 'update' commands."
                 exit 1
             fi
         ;;
@@ -189,6 +208,7 @@ while [[ $# -gt 0 ]]; do
             if [[ "$COMMAND" == "install-script" ]]; then
                 if [[ -n "$2" && "$2" =~ remnanode\.sh$ ]]; then
                     SCRIPT_URL="$2"
+                    SCRIPT_URL_OVERRIDDEN="true"
                     shift 2
                 else
                     echo "Error: --source parameter must be a URL to a remnanode.sh file."
@@ -301,7 +321,25 @@ GEOIP_FILE="$DATA_DIR/geoip.dat"
 GEOSITE_FILE="$DATA_DIR/geosite.dat"
 
 # Default internal port (XTLS_API only, other internal ports now use unix sockets)
+# Legacy: remnawave/node dropped XTLS_API_PORT from its config schema in 2.8.0 and
+# replaced it with XTLS_API_SOCKET_PATH (an abstract unix socket generated at
+# container start by /etc/s6-overlay/scripts/init-env.sh). The value is still
+# written to .env for anyone pinned to <= 2.7.x, but it must never block an install.
 DEFAULT_XTLS_API_PORT=61000
+
+# --- Node <-> panel version coupling -----------------------------------------
+# Since remnawave/node 3.3.0 the node's HTTPS listener installs an SNICallback
+# that rejects every TLS handshake whose SNI != deriveSni(caCert, jwtPublicKey)
+# (node: src/main.ts -> makeSniVerifier, plus requestCert/rejectUnauthorized).
+# The matching client-side helper exists in the panel only from backend 3.3.0 on
+# (src/common/utils/certs/generate-servername.util.ts, used by axios.service.ts).
+#
+#   node >= 3.3.0  +  panel <  3.3.0  ->  every request dies with "unknown sni"
+#   node <  3.3.0  +  panel >= 3.3.0  ->  fine (old node ignores the servername)
+#
+# So a node may only be moved onto the 3.3.0 line once the panel is there too.
+NODE_SNI_MIN_VERSION="3.3.0"
+PANEL_COMPAT_ACK_FILE="$APP_DIR/.panel-compat-ack"
 
 # Deprecated ports (removed in v2.5.0+ of remnawave/node)
 # SUPERVISORD_PORT and INTERNAL_REST_PORT are no longer needed
@@ -477,10 +515,37 @@ install_remnanode_script() {
     colorized_echo blue "Installing remnanode script v$SCRIPT_VERSION"
     TARGET_PATH="/usr/local/bin/$APP_NAME"
 
-    curl -sSL $SCRIPT_URL -o $TARGET_PATH
-    colorized_echo blue "Fetched remnawave script from $SCRIPT_URL"
+    [ -d /usr/local/bin ] || mkdir -p /usr/local/bin
 
-    chmod 755 $TARGET_PATH
+    # Download to a temp file and validate before touching $TARGET_PATH: a
+    # half-transferred file or a captive-portal page must never replace a
+    # working CLI. Falls through the mirror list (GitHub raw, then jsDelivr).
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.inst.XXXXXX") || {
+        colorized_echo red "Failed to create temporary file"
+        exit 1
+    }
+
+    if ! fetch_script_file "$tmp"; then
+        rm -f "$tmp"
+        colorized_echo yellow "⚠️  Could not download the script from any mirror"
+        # Fall back to the copy we are executing right now — it is by definition
+        # a valid script of this exact version.
+        if [ -f "${BASH_SOURCE[0]}" ] && install -m 755 "${BASH_SOURCE[0]}" "$TARGET_PATH" 2>/dev/null; then
+            colorized_echo green "Remnanode script v$SCRIPT_VERSION installed from the local copy at $TARGET_PATH"
+            return 0
+        fi
+        colorized_echo red "Failed to install remnanode script at $TARGET_PATH"
+        exit 1
+    fi
+
+    if ! install -m 755 "$tmp" "$TARGET_PATH"; then
+        rm -f "$tmp"
+        colorized_echo red "Failed to install remnanode script at $TARGET_PATH"
+        exit 1
+    fi
+    rm -f "$tmp"
+    colorized_echo blue "Fetched remnanode script from $SCRIPT_SOURCE_USED"
 
     # Получаем версию установленного скрипта
     local installed_version=$(grep "^SCRIPT_VERSION=" "$TARGET_PATH" 2>/dev/null | head -1 | cut -d'"' -f2)
@@ -935,6 +1000,223 @@ enable_socket_command() {
     fi
 }
 
+# Compare two dotted versions. Returns 0 when $1 >= $2.
+# Non-numeric tags (latest, dev, ...) are handled by the callers, not here.
+version_gte() {
+    [ "$1" = "$2" ] && return 0
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
+# ===== Script self-delivery =================================================
+
+# Mirrors, most authoritative first. A --source override wins outright.
+script_mirror_urls() {
+    if [ "$SCRIPT_URL_OVERRIDDEN" = "true" ]; then
+        printf '%s\n' "$SCRIPT_URL"
+        return 0
+    fi
+    printf '%s\n' \
+        "https://raw.githubusercontent.com/${SCRIPT_REPO}/${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://cdn.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://fastly.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://gcore.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://testingcf.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}"
+}
+
+# A downloaded file is only accepted as "our script" if it carries a shebang,
+# a version line, a plausible size, and — decisively — parses as bash. That
+# rejects captive-portal pages, CDN error bodies and truncated transfers, all
+# of which would otherwise be installed over a working script.
+script_download_is_valid() {
+    local file="$1"
+
+    [ -s "$file" ] || return 1
+    head -n1 "$file" | grep -q '^#!' || return 1
+    grep -q "^SCRIPT_VERSION=" "$file" || return 1
+    [ "$(wc -c < "$file" 2>/dev/null || echo 0)" -ge 20000 ] || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+
+    return 0
+}
+
+# Download the script into $1, trying every mirror. Sets SCRIPT_SOURCE_USED.
+fetch_script_file() {
+    local out="$1"
+    local url
+
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        if curl -fsSL --connect-timeout 7 --max-time 90 --retry 1 --retry-delay 1 \
+                "$url" -o "$out" 2>/dev/null && script_download_is_valid "$out"; then
+            SCRIPT_SOURCE_USED="$url"
+            return 0
+        fi
+        rm -f "$out" 2>/dev/null || true
+    done < <(script_mirror_urls)
+
+    return 1
+}
+
+# Version string of a downloaded script file.
+script_file_version() {
+    grep "^SCRIPT_VERSION=" "$1" 2>/dev/null | head -1 | cut -d'"' -f2
+}
+
+# Latest published version, or empty when every mirror is unreachable.
+get_remote_script_version() {
+    local tmp ver
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.ver.XXXXXX") || return 1
+    if fetch_script_file "$tmp"; then
+        ver=$(script_file_version "$tmp")
+        rm -f "$tmp"
+        printf '%s' "$ver"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# Install the running script fresh from the mirrors and hand control over to it
+# with the user's original arguments. Never asks: an outdated script cannot be
+# trusted to run the current migrations, so staying on it is not an option.
+#
+# REMNANODE_SELFUPDATE_DONE guards against a re-exec loop if the installed copy
+# still reports an old version (different install path, read-only /usr/local/bin).
+ensure_latest_script() {
+    local target_path="/usr/local/bin/$APP_NAME"
+
+    [ "${REMNANODE_SELFUPDATE_DONE:-0}" = "1" ] && return 0
+    [ "$SCRIPT_URL_OVERRIDDEN" = "true" ] && return 0
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.upd.XXXXXX") || return 0
+
+    if ! fetch_script_file "$tmp"; then
+        rm -f "$tmp"
+        colorized_echo yellow "⚠️  Could not reach any script mirror — continuing with v$SCRIPT_VERSION"
+        return 0
+    fi
+
+    local remote_version
+    remote_version=$(script_file_version "$tmp")
+
+    if [ -z "$remote_version" ] || ! version_gte "$remote_version" "$SCRIPT_VERSION" || \
+       [ "$remote_version" = "$SCRIPT_VERSION" ]; then
+        rm -f "$tmp"
+        colorized_echo green "✅ Script is up to date (v$SCRIPT_VERSION)"
+        return 0
+    fi
+
+    colorized_echo yellow "🔄 Script update: v$SCRIPT_VERSION → v$remote_version (applying automatically)"
+    colorized_echo gray   "   Source: $SCRIPT_SOURCE_USED"
+
+    if [ ! -d /usr/local/bin ]; then
+        mkdir -p /usr/local/bin 2>/dev/null || true
+    fi
+
+    if ! install -m 755 "$tmp" "$target_path" 2>/dev/null; then
+        rm -f "$tmp"
+        colorized_echo yellow "⚠️  Could not write $target_path — continuing with v$SCRIPT_VERSION"
+        return 0
+    fi
+    rm -f "$tmp"
+
+    local installed_version
+    installed_version=$(grep "^SCRIPT_VERSION=" "$target_path" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [ "$installed_version" != "$remote_version" ]; then
+        colorized_echo yellow "⚠️  Update verification failed (expected v$remote_version, got v${installed_version:-unknown})"
+        return 0
+    fi
+
+    colorized_echo green "✅ Updated to v$installed_version — continuing"
+    echo
+
+    export REMNANODE_SELFUPDATE_DONE=1
+    exec "$target_path" "${SCRIPT_ORIGINAL_ARGS[@]}"
+}
+
+# True when the requested tag lands on (or past) the SNI-gated node line.
+# Floating tags (latest / dev) always do, because the newest release is 3.3.0+.
+node_tag_needs_sni_panel() {
+    local tag="$1"
+
+    case "$tag" in
+        latest|dev|"") return 0 ;;
+    esac
+
+    # Strip a leading "v" and anything after the patch (e.g. 3.3.0-rc1)
+    local ver="${tag#v}"
+    ver="${ver%%-*}"
+
+    if [[ "$ver" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+        version_gte "$ver" "$NODE_SNI_MIN_VERSION" && return 0
+        return 1
+    fi
+
+    # Unrecognised tag → assume it may be new
+    return 0
+}
+
+# One-time confirmation that the panel is already on 3.3.0+ before moving the
+# node onto the SNI-gated line. Once acknowledged we never ask again.
+# Returns 0 to proceed, 1 to abort.
+confirm_panel_supports_sni() {
+    local tag="$1"
+    local context="${2:-install}"
+
+    node_tag_needs_sni_panel "$tag" || return 0
+    [ -f "$PANEL_COMPAT_ACK_FILE" ] && return 0
+
+    if [ "$FORCE_MODE" == "true" ]; then
+        colorized_echo yellow "⚠️  node >= $NODE_SNI_MIN_VERSION requires Remnawave panel >= $NODE_SNI_MIN_VERSION (--force: not asking)"
+        mark_panel_compat_ack
+        return 0
+    fi
+
+    if [ ! -t 0 ]; then
+        colorized_echo yellow "⚠️  node >= $NODE_SNI_MIN_VERSION requires Remnawave panel >= $NODE_SNI_MIN_VERSION (non-interactive: not asking)"
+        mark_panel_compat_ack
+        return 0
+    fi
+
+    echo
+    colorized_echo yellow "==================================================="
+    colorized_echo yellow "⚠️  Panel version requirement"
+    colorized_echo yellow "==================================================="
+    colorized_echo white  "   remnawave/node $NODE_SNI_MIN_VERSION+ only accepts connections from a"
+    colorized_echo white  "   panel running $NODE_SNI_MIN_VERSION or newer."
+    echo
+    colorized_echo gray   "   Since $NODE_SNI_MIN_VERSION the node rejects the TLS handshake unless the"
+    colorized_echo gray   "   panel presents a derived SNI. On an older panel the node will"
+    colorized_echo gray   "   simply show up as offline ('unknown sni' in the node logs)."
+    echo
+    colorized_echo gray   "   Older panel? Pin the matching node line instead:"
+    colorized_echo green  "      sudo $APP_NAME $context --tag 3.2.2"
+    echo
+    read -p "   Is your panel already on $NODE_SNI_MIN_VERSION or newer? [y/N]: " -r panel_ok
+    echo
+
+    if [[ ! "$panel_ok" =~ ^[Yy]$ ]]; then
+        colorized_echo red "❌ Cancelled — upgrade the panel first, or re-run with --tag 3.2.2"
+        return 1
+    fi
+
+    mark_panel_compat_ack
+    return 0
+}
+
+# Record that the panel-compat question has been settled, so neither `update`
+# nor `up` asks (or holds back the pull) again.
+mark_panel_compat_ack() {
+    mkdir -p "$APP_DIR" 2>/dev/null || true
+    {
+        echo "# The Remnawave panel is on $NODE_SNI_MIN_VERSION+ (operator-confirmed, or"
+        echo "# accepted implicitly via --force / a non-interactive run)."
+        echo "# node $NODE_SNI_MIN_VERSION+ enforces a derived-SNI TLS handshake."
+        echo "acknowledged_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    } > "$PANEL_COMPAT_ACK_FILE" 2>/dev/null || true
+}
+
 # Newest published node tags, best-effort (Docker Hub needs no auth and mirrors
 # the same tags as GHCR). Used to make a wrong --tag actionable.
 list_available_node_tags() {
@@ -1056,12 +1338,15 @@ install_remnanode() {
     fi
 
     # ============================================
-    # Internal Ports Configuration (simplified in v4.0.0)
-    # Since remnawave/node v2.5.0, only XTLS_API_PORT is configurable
-    # Other internal ports now use unix sockets
+    # Internal ports (legacy XTLS_API_PORT only)
+    #
+    # remnawave/node removed XTLS_API_PORT from its config schema in 2.8.0 and
+    # replaced it with XTLS_API_SOCKET_PATH, an abstract unix socket generated
+    # inside the container by /etc/s6-overlay/scripts/init-env.sh. Nothing binds
+    # 61000 on a modern node, so this value must never block or interrupt an
+    # install — it is kept in .env purely for installs pinned to <= 2.7.x.
     # ============================================
-    
-    # Get XTLS_API_PORT (from command line, force mode defaults, or interactive)
+
     if [ -n "$FORCE_XTLS_PORT" ]; then
         XTLS_API_PORT="$FORCE_XTLS_PORT"
         if ! validate_port "$XTLS_API_PORT"; then
@@ -1069,76 +1354,28 @@ install_remnanode() {
             exit 1
         fi
         if is_port_occupied "$XTLS_API_PORT"; then
-            colorized_echo red "❌ XTLS_API_PORT $XTLS_API_PORT is already in use!"
-            exit 1
+            colorized_echo yellow "⚠️  XTLS_API_PORT $XTLS_API_PORT is in use (harmless on node 2.8.0+, which ignores it)"
         fi
         colorized_echo green "✅ Using XTLS_API_PORT: $XTLS_API_PORT"
-    elif [ "$FORCE_MODE" == "true" ]; then
-        # Force mode without explicit port: use default
-        XTLS_API_PORT=$DEFAULT_XTLS_API_PORT
-        if is_port_occupied "$XTLS_API_PORT"; then
-            colorized_echo red "❌ Default XTLS_API_PORT $XTLS_API_PORT is already in use!"
-            colorized_echo yellow "   Use --xtls-port=PORT to specify a different port"
-            exit 1
-        fi
-        colorized_echo green "✅ Using default XTLS_API_PORT: $XTLS_API_PORT"
     else
-        echo
-        colorized_echo cyan "🔧 Internal Ports Configuration"
-        colorized_echo gray "   Only XTLS_API_PORT is configurable (for Xray gRPC API)."
-        colorized_echo gray "   Other internal ports now use unix sockets automatically."
-        echo
-        
-        # Set default XTLS_API_PORT
         XTLS_API_PORT=$DEFAULT_XTLS_API_PORT
-        
-        # Check if default port is available
+        # Pick the next free port instead of aborting: on node 2.8.0+ the value is
+        # unused anyway, and on <= 2.7.x a free port is what we want regardless.
         if is_port_occupied "$XTLS_API_PORT"; then
-            colorized_echo yellow "⚠️  Default XTLS_API_PORT ($XTLS_API_PORT) is already in use."
-            colorized_echo blue "   You'll need to enter a custom port."
-            
-            while true; do
-                read -p "  Enter XTLS_API_PORT: " -r input_port
-                if [ -z "$input_port" ]; then
-                    colorized_echo red "  Port is required."
-                    continue
-                fi
-                if validate_port "$input_port"; then
-                    if is_port_occupied "$input_port"; then
-                        colorized_echo red "  Port $input_port is already in use."
-                    else
-                        XTLS_API_PORT=$input_port
-                        break
-                    fi
-                else
-                    colorized_echo red "  Invalid port. Please enter a port between 1 and 65535."
-                fi
+            local candidate=$XTLS_API_PORT
+            local attempts=0
+            while [ $attempts -lt 50 ] && is_port_occupied "$candidate"; do
+                candidate=$((candidate + 1))
+                attempts=$((attempts + 1))
             done
-        else
-            colorized_echo green "✅ Default XTLS_API_PORT ($XTLS_API_PORT) is available."
-            
-            echo
-            read -p "Do you want to customize XTLS_API_PORT? [y/N]: " -r customize_ports
-            if [[ $customize_ports =~ ^[Yy]$ ]]; then
-                while true; do
-                    read -p "  XTLS_API_PORT (default $XTLS_API_PORT): " -r input_port
-                    input_port=${input_port:-$XTLS_API_PORT}
-                    if validate_port "$input_port"; then
-                        if is_port_occupied "$input_port"; then
-                            colorized_echo red "  Port $input_port is already in use."
-                        else
-                            XTLS_API_PORT=$input_port
-                            break
-                        fi
-                    else
-                        colorized_echo red "  Invalid port. Please enter a port between 1 and 65535."
-                    fi
-                done
+            if [ $attempts -lt 50 ]; then
+                colorized_echo yellow "⚠️  Default XTLS_API_PORT $XTLS_API_PORT is in use → using $candidate"
+                XTLS_API_PORT=$candidate
+            else
+                colorized_echo yellow "⚠️  Could not find a free port near $XTLS_API_PORT — keeping $XTLS_API_PORT (unused on node 2.8.0+)"
             fi
         fi
-        
-        echo
-        colorized_echo green "✅ Using XTLS_API_PORT: $XTLS_API_PORT"
+        colorized_echo gray "ℹ️  XTLS_API_PORT: $XTLS_API_PORT (legacy, ignored by node 2.8.0+; override with --xtls-port)"
     fi
     echo
 
@@ -1164,7 +1401,8 @@ NODE_PORT=$NODE_PORT
 ### XRAY ###
 SECRET_KEY=$SECRET_KEY_VALUE
 
-### Internal port (only XTLS_API_PORT is configurable since node v2.5.0)
+### Legacy: removed from the node config schema in 2.8.0 (replaced by an
+### internally generated XTLS_API_SOCKET_PATH). Kept for installs pinned to <= 2.7.x.
 XTLS_API_PORT=$XTLS_API_PORT
 EOL
     colorized_echo green "Environment file saved in $ENV_FILE"
@@ -1190,6 +1428,11 @@ EOL
             exit 1
         fi
         colorized_echo green "✅ Pinned node image: ${IMAGE_REGISTRY}:${IMAGE_TAG}"
+    fi
+
+    # node 3.3.0+ only talks to panel 3.3.0+ (derived-SNI TLS gate) — confirm once
+    if ! confirm_panel_supports_sni "$IMAGE_TAG" "install"; then
+        exit 1
     fi
 
     colorized_echo blue "Generating docker-compose.yml file"
@@ -1350,6 +1593,18 @@ docker_pull_with_retry() {
     done
 }
 
+# True when the image docker-compose.yml points at is already in the local store.
+image_present_locally() {
+    [ -f "$COMPOSE_FILE" ] || return 1
+
+    local image
+    image=$(grep -E "^[[:space:]]*image:[[:space:]]*[^[:space:]]*remnawave/node:" "$COMPOSE_FILE" 2>/dev/null \
+            | head -1 | sed 's/.*image:[[:space:]]*//' | tr -d "\"'" | xargs)
+    [ -n "$image" ] || return 1
+
+    [ -n "$(docker images "$image" --format '{{.ID}}' 2>/dev/null | head -1)" ]
+}
+
 up_remnanode() {
     # Run migration for deprecated ports before starting (silent mode)
     migrate_deprecated_ports 2>/dev/null || true
@@ -1360,8 +1615,18 @@ up_remnanode() {
     # Run migration for log volumes /var/lib -> /var/log (silent mode)
     migrate_log_volumes 2>/dev/null || true
 
-    # Pull images with retry to handle transient network failures
-    docker_pull_with_retry
+    # `up` and `restart` are lifecycle commands, not upgrades. Pulling here would
+    # silently move anyone on a floating tag onto a newer node release just for
+    # restarting a container — including onto 3.3.0+, which stops talking to a
+    # panel below 3.3.0. Whoever wants a new image runs `update`.
+    #
+    # The one exception is a first start with nothing in the local image store:
+    # there is no version to preserve, and pulling explicitly keeps the retry
+    # logic that a bare `compose up` does not have.
+    if ! image_present_locally; then
+        colorized_echo blue "Image not present locally — downloading it"
+        docker_pull_with_retry
+    fi
 
     $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" up -d --remove-orphans
 }
@@ -1394,26 +1659,23 @@ update_remnanode_script() {
     # на минимальных системах /dev/stdin недоступен и install падает с
     # "No such file or directory", curl получает ошибку 23, а файл остаётся
     # старым — из-за чего вызывающий код зацикливался на обновлении.
+    # fetch_script_file обходит все зеркала и валидирует результат (shebang,
+    # версия, размер, `bash -n`), так что подменить рабочий CLI мусором нельзя.
     local tmp_file
     tmp_file=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX") || {
         colorized_echo red "Failed to create temporary file"
         return 1
     }
 
-    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_file"; then
-        colorized_echo red "Failed to download script from $SCRIPT_URL"
+    if ! fetch_script_file "$tmp_file"; then
+        colorized_echo red "Failed to download a valid script from any mirror"
         rm -f "$tmp_file"
         return 1
     fi
 
-    # Проверяем, что скачали валидный скрипт (shebang + версия)
     local new_version
-    new_version=$(grep "^SCRIPT_VERSION=" "$tmp_file" 2>/dev/null | head -1 | cut -d'"' -f2)
-    if [ -z "$new_version" ] || ! head -n1 "$tmp_file" | grep -q '^#!'; then
-        colorized_echo red "Downloaded file is not a valid remnanode script — aborting update"
-        rm -f "$tmp_file"
-        return 1
-    fi
+    new_version=$(script_file_version "$tmp_file")
+    colorized_echo blue "Fetched from $SCRIPT_SOURCE_USED"
 
     # Устанавливаем из обычного файла (без /dev/stdin)
     if ! install -m 755 "$tmp_file" "$target_path"; then
@@ -2683,33 +2945,12 @@ update_command() {
     
     # Проверяем и обновляем скрипт ПЕРВЫМ ДЕЛОМ
     echo -e "\033[38;5;250m📝 Step 1:\033[0m Checking script version..."
-    local current_script_version="$SCRIPT_VERSION"
-    local remote_script_version=$(curl -s "$SCRIPT_URL" 2>/dev/null | grep "^SCRIPT_VERSION=" | cut -d'"' -f2)
-    local script_was_updated=false
-    
-    if [ -z "$remote_script_version" ]; then
-        echo -e "\033[1;33m⚠️  Unable to check remote script version\033[0m"
-        echo -e "\033[38;5;8m   Current version: v$current_script_version\033[0m"
-        echo -e "\033[38;5;8m   Continuing with Docker image check...\033[0m"
-    elif [ "$remote_script_version" != "$current_script_version" ]; then
-        echo -e "\033[1;33m🔄 Script update available:\033[0m \033[38;5;8mv$current_script_version\033[0m → \033[1;37mv$remote_script_version\033[0m"
-        echo -e "\033[38;5;250m   Updating script first (required for migrations)...\033[0m"
-        
-        if update_remnanode_script; then
-            echo -e "\033[1;32m✅ Script updated:\033[0m \033[38;5;8mv$current_script_version\033[0m → \033[1;37mv$remote_script_version\033[0m"
-            echo -e "\033[1;33m⚠️  Script updated! Please run '\033[38;5;15msudo $APP_NAME update\033[1;33m' again to continue.\033[0m"
-            echo -e "\033[38;5;8m   This ensures all new features and migrations work correctly.\033[0m"
-            script_was_updated=true
-            exit 0
-        else
-            echo -e "\033[1;31m❌ Failed to update script\033[0m"
-            exit 1
-        fi
-    else
-        echo -e "\033[1;32m✅ Script is up to date:\033[0m \033[38;5;15mv$current_script_version\033[0m"
-    fi
+    # Applies a newer script and re-execs into it with the same arguments — no
+    # prompt, no "please run update again". Migrations only ship with the script,
+    # so running an update from an outdated copy is never the right outcome.
+    ensure_latest_script
     echo
-    
+
     # Определяем используемый тег из docker-compose.yml
     local current_tag="latest"
     if [ -f "$COMPOSE_FILE" ]; then
@@ -2719,20 +2960,68 @@ update_command() {
         fi
     fi
     
-    echo -e "\033[38;5;250m🏷️  Current tag:\033[0m \033[38;5;15m$current_tag\033[0m"
-    
-    # Получаем локальную версию образа
-    echo -e "\033[38;5;250m📝 Step 2:\033[0m Checking local image version..."
-    local local_image_id=""
-    local local_created=""
-    # Determine registry from compose file (ghcr.io or Docker Hub)
+    # Determine registry from compose file (ghcr.io or Docker Hub) — needed both
+    # for the optional --tag re-pin below and for the image lookups further down.
     local image_name
     if grep -q "ghcr.io/remnawave/node" "$COMPOSE_FILE" 2>/dev/null; then
         image_name="ghcr.io/remnawave/node"
     else
         image_name="remnawave/node"
     fi
-    
+
+    # `update --tag X` re-pins the compose image. This is the escape hatch out of
+    # the SNI-gated 3.3.0 line for anyone still on panel 3.2.x.
+    #
+    # The target tag is what the node will actually run, so it — not the tag
+    # currently in the file — is what the panel-compat gate has to judge. The
+    # gate therefore runs BEFORE anything is written: declining must leave the
+    # installation exactly as it was.
+    local requested_tag="$current_tag"
+    local tag_repinned=false
+    if [ -n "$NODE_IMAGE_TAG" ] && [ "$NODE_IMAGE_TAG" != "$current_tag" ]; then
+        requested_tag="$NODE_IMAGE_TAG"
+    fi
+
+    echo -e "\033[38;5;250m🏷️  Current tag:\033[0m \033[38;5;15m$current_tag\033[0m"
+    if [ "$requested_tag" != "$current_tag" ]; then
+        echo -e "\033[38;5;250m🏷️  Requested tag:\033[0m \033[38;5;15m$requested_tag\033[0m"
+    fi
+
+    # node 3.3.0+ only talks to panel 3.3.0+ (derived-SNI TLS gate) — confirm once,
+    # BEFORE anything is pulled or rewritten, so a wrong answer costs nothing.
+    if ! confirm_panel_supports_sni "$requested_tag" "update"; then
+        exit 0
+    fi
+
+    if [ "$requested_tag" != "$current_tag" ]; then
+        if ! verify_node_tag_exists "$image_name" "$requested_tag"; then
+            echo -e "\033[1;31m❌ Image ${image_name}:${requested_tag} was not found in the registry.\033[0m"
+            exit 1
+        fi
+
+        cp "$COMPOSE_FILE" "${COMPOSE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        sed -i -E "s|(image:[[:space:]]*)([^[:space:]]*remnawave/node):[^[:space:]\"']*|\1\2:${requested_tag}|" "$COMPOSE_FILE"
+
+        # Confirm the rewrite actually landed — a compose file with an unexpected
+        # image line would otherwise be reported as re-pinned while unchanged.
+        local repinned_tag
+        repinned_tag=$(grep -E "image:.*remnawave/node:" "$COMPOSE_FILE" | sed 's/.*remnawave\/node://' | tr -d '"' | tr -d "'" | xargs)
+        if [ "$repinned_tag" != "$requested_tag" ]; then
+            echo -e "\033[1;31m❌ Could not re-pin the image in $COMPOSE_FILE (still '${repinned_tag:-unknown}')\033[0m"
+            echo -e "\033[38;5;244m   Edit the 'image:' line by hand, then re-run the update.\033[0m"
+            exit 1
+        fi
+
+        echo -e "\033[1;32m✅ Re-pinned node image:\033[0m \033[38;5;15m${image_name}:${requested_tag}\033[0m"
+        current_tag="$requested_tag"
+        tag_repinned=true
+    fi
+
+    # Получаем локальную версию образа
+    echo -e "\033[38;5;250m📝 Step 2:\033[0m Checking local image version..."
+    local local_image_id=""
+    local local_created=""
+
     if docker images ${image_name}:$current_tag --format "table {{.ID}}\t{{.CreatedAt}}" | grep -v "IMAGE ID" > /dev/null 2>&1; then
         local_image_id=$(docker images ${image_name}:$current_tag --format "{{.ID}}" | head -1)
         local_created=$(docker images ${image_name}:$current_tag --format "{{.CreatedAt}}" | head -1 | cut -d' ' -f1,2)
@@ -2778,6 +3067,29 @@ update_command() {
         local update_reason="Unable to verify current version"
         local new_image_id="$old_image_id"
     fi
+
+    # The pull comparison only answers "did the image behind this tag change".
+    # It says nothing about whether the RUNNING container is built from it, so
+    # two cases would otherwise end in a silent no-op:
+    #   • `update --tag X` where X is already in the local image store
+    #   • an earlier update that pulled but was interrupted before the restart
+    # Reconcile against the container itself.
+    if [ "$needs_update" = false ]; then
+        local running_image_id=""
+        running_image_id=$(docker inspect -f '{{.Image}}' "$APP_NAME" 2>/dev/null | sed 's/^sha256://' | cut -c1-12)
+        local target_image_id="$new_image_id"
+
+        if [ "$tag_repinned" = true ]; then
+            needs_update=true
+            update_reason="Image re-pinned to ${current_tag}"
+            echo -e "\033[1;33m🔄 Re-pinned to ${current_tag} — container must be recreated\033[0m"
+        elif [ -n "$running_image_id" ] && [ -n "$target_image_id" ] && \
+             [ "$target_image_id" != "none" ] && [ "$running_image_id" != "$target_image_id" ]; then
+            needs_update=true
+            update_reason="Running container does not match ${image_name}:${current_tag}"
+            echo -e "\033[1;33m🔄 Running container is out of sync with the compose image\033[0m"
+        fi
+    fi
     
     echo
     echo -e "\033[1;37m📊 Update Analysis:\033[0m"
@@ -2788,9 +3100,12 @@ update_command() {
         echo -e "\033[38;5;250m   Reason: \033[38;5;15m$update_reason\033[0m"
         echo
         
-        # Если новая версия уже загружена, автоматически продолжаем
-        if [[ "$update_reason" == *"downloaded"* ]]; then
-            echo -e "\033[1;37m🚀 New version already downloaded, proceeding with update...\033[0m"
+        # Автоматически продолжаем, когда решение уже принято: новая версия
+        # скачана, пользователь явно задал --tag, или контейнер рассинхронизирован
+        # с compose-файлом (в последних двух случаях спрашивать нечего).
+        if [[ "$update_reason" == *"downloaded"* ]] || [ "$tag_repinned" = true ] || \
+           [[ "$update_reason" == *"does not match"* ]] || [ "$FORCE_MODE" == "true" ] || [ ! -t 0 ]; then
+            echo -e "\033[1;37m🚀 Proceeding with update...\033[0m"
         else
             read -p "Do you want to proceed with the update? (y/n): " -r confirm_update
             if [[ ! $confirm_update =~ ^[Yy]$ ]]; then
@@ -4223,25 +4538,33 @@ usage() {
 
     echo -e "\033[1;37m🚀 Core Commands:\033[0m"
     printf "   \033[38;5;15m%-18s\033[0m %s\n" "install" "🛠️  Install RemnaNode"
-    printf "   \033[38;5;15m%-18s\033[0m %s\n" "update" "⬆️  Update to latest version"
+    printf "   \033[38;5;15m%-18s\033[0m %s\n" "update" "⬆️  Update to latest version (accepts --tag)"
     printf "   \033[38;5;15m%-18s\033[0m %s\n" "uninstall" "🗑️  Remove RemnaNode completely"
+    echo
+
+    echo -e "\033[1;33m⚠️  Panel version requirement:\033[0m"
+    echo -e "\033[38;5;244m      remnawave/node 3.3.0+ only accepts connections from a panel on\033[0m"
+    echo -e "\033[38;5;244m      3.3.0 or newer (the node enforces a derived-SNI TLS handshake).\033[0m"
+    echo -e "\033[38;5;244m      Still on panel 3.2.x?  $APP_NAME install --tag 3.2.2\033[0m"
+    echo -e "\033[38;5;244m                             $APP_NAME update  --tag 3.2.2\033[0m"
     echo
 
     echo -e "\033[1;37m🎯 Install Options:\033[0m"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--force, -f" "Non-interactive mode (skip confirmations)"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--secret-key=KEY" "Set SECRET_KEY from panel"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--port=PORT" "Set NODE_PORT (default: 3000)"
-    printf "   \033[38;5;244m%-18s\033[0m %s\n" "--xtls-port=PORT" "Set XTLS_API_PORT (default: 61000)"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "--xtls-port=PORT" "Set legacy XTLS_API_PORT (ignored by node 2.8.0+)"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--xray" "Install latest Xray-core"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--no-xray" "Skip Xray-core (default in force mode)"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--name NAME" "Custom installation name"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--dev" "Use development image"
-    printf "   \033[38;5;244m%-18s\033[0m %s\n" "--tag TAG" "Pin node image version (e.g. 2.8.0)"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "--tag TAG" "Pin node image version (e.g. 3.2.2)"
     echo
     echo -e "\033[38;5;244m   💡 --tag keeps the node on an older release for panels that are not\033[0m"
     echo -e "\033[38;5;244m      updated yet. Use an EXACT version — remnawave/node publishes only\033[0m"
     echo -e "\033[38;5;244m      exact tags (2.8.0, 3.0.0, ...), there is no floating '2'/'3' tag.\033[0m"
-    echo -e "\033[38;5;244m      A pinned node stays on that version: 'update' will not move it.\033[0m"
+    echo -e "\033[38;5;244m      A pinned node stays on that version: 'update' will not move it,\033[0m"
+    echo -e "\033[38;5;244m      and 'update --tag X' re-pins an existing install to X.\033[0m"
     echo
 
     echo -e "\033[1;37m⚙️  Service Control:\033[0m"
@@ -4417,6 +4740,11 @@ autorestart_menu() {
 }
 
 main_menu() {
+    # Pull in a newer script before showing the menu. Applied without asking and
+    # re-exec'd in place: every menu action below assumes the current migrations
+    # and generators, which only exist in the current script.
+    ensure_latest_script
+
     while true; do
         clear
         echo -e "\033[1;37m🚀 $APP_NAME Node Management\033[0m \033[38;5;244mv$SCRIPT_VERSION\033[0m"

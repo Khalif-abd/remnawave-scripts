@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Remnawave Panel Installation Script
 # This script installs and manages Remnawave Panel
-# VERSION=6.5.0
+# VERSION=6.6.0
 
-SCRIPT_VERSION="6.5.0"
+SCRIPT_VERSION="6.6.0"
 BACKUP_SCRIPT_VERSION="1.5.0"  # Версия backup скрипта создаваемого Schedule функцией
 
+# Original invocation, captured before any shifting, so a self-update can
+# re-exec the new script with exactly the command the user typed.
+SCRIPT_ORIGINAL_ARGS=("$@")
+
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
-    shift  
+    shift
 fi
 
 if [ $# -gt 0 ]; then
@@ -15,7 +19,22 @@ if [ $# -gt 0 ]; then
     shift
 fi
 
-SCRIPT_URL="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/remnawave.sh"  # Update with actual URL
+# ============================================
+# Script delivery
+#
+# raw.githubusercontent.com is unreachable on a good share of the networks these
+# servers live on (blocked, DNS-poisoned or rate-limited), so every download
+# walks a mirror list and takes the first source that returns something which
+# actually parses as this script. jsDelivr serves the same git ref from several
+# independent CDNs; it is only a fallback because a branch ref can be cached
+# there for up to ~12h, while raw.githubusercontent is always current.
+# ============================================
+SCRIPT_REPO="DigneZzZ/remnawave-scripts"
+SCRIPT_REF="main"
+SCRIPT_FILE="remnawave.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/${SCRIPT_REPO}/${SCRIPT_REF}/${SCRIPT_FILE}"
+SCRIPT_URL_OVERRIDDEN="false"   # set by --source
+SCRIPT_SOURCE_USED=""           # mirror the last successful download came from
 
 while [[ $# -gt 0 ]]; do  
     key="$1"  
@@ -43,6 +62,7 @@ while [[ $# -gt 0 ]]; do
             if [[ "$COMMAND" == "install-script" ]]; then
                 if [[ -n "$2" && "$2" =~ remnawave\.sh$ ]]; then
                     SCRIPT_URL="$2"
+                    SCRIPT_URL_OVERRIDDEN="true"
                     shift 2
                 else
                     echo "Error: --source parameter must be a URL to a remnawave.sh file."
@@ -944,6 +964,187 @@ check_compose_v588_migration_needed() {
     return 1
 }
 
+# ===== v6.6.0 subscription-page migration =====
+#
+# 1) Port mapping. Older generated compose files published the subscription page
+#    as '127.0.0.1:<host>:${APP_PORT:-3010}'. Compose interpolates ${APP_PORT}
+#    from the PROJECT .env (the panel's, APP_PORT=3000) and never from a
+#    service's env_file, so the container port resolved to the panel's port and
+#    the published host port pointed at nothing. Anything reaching the page over
+#    127.0.0.1 (a host-level nginx/Angie/Traefik, health checks) got a refused
+#    connection. Only setups using the bundled Caddy were unaffected, because
+#    Caddy talks to the container over the docker network.
+#
+# 2) TRUST_PROXY. subscription-page resolves the real client IP through Express
+#    "trust proxy"; without it a proxied setup logs the proxy's IP.
+
+check_subpage_compose_ports_migration_needed() {
+    [ -f "$COMPOSE_FILE" ] || return 1
+    grep -qE "127\.0\.0\.1:[0-9]+:\\\$\{APP_PORT:-3010\}" "$COMPOSE_FILE" 2>/dev/null
+}
+
+migrate_subpage_compose_ports() {
+    [ -f "$COMPOSE_FILE" ] || return 1
+
+    echo -e "\033[1;36m🔄 Fixing subscription-page port mapping\033[0m"
+
+    # The container port is the source of truth, not the published one: the
+    # container really does listen on .env.subscription's APP_PORT, and the
+    # bundled Caddy already reaches it there over the docker network. Only the
+    # published side is wrong (it resolved to the panel's APP_PORT), and since
+    # that mapping is dead today nothing can be depending on it — so republish
+    # on the container's own port and leave everything else alone.
+    local app_port=""
+    if [ -f "$SUB_ENV_FILE" ]; then
+        app_port=$(grep "^APP_PORT=" "$SUB_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d "\"' ")
+    fi
+    if [[ ! "$app_port" =~ ^[0-9]+$ ]]; then
+        # subscription-page defaults APP_PORT to 3010 when the key is absent
+        app_port=3010
+        if [ -f "$SUB_ENV_FILE" ] && ! grep -q "^APP_PORT=" "$SUB_ENV_FILE" 2>/dev/null; then
+            cp "$SUB_ENV_FILE" "${SUB_ENV_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+            printf '\n### Port the container listens on (must match the compose port mapping)\nAPP_PORT=%s\n' "$app_port" >> "$SUB_ENV_FILE"
+            echo -e "\033[38;5;244m  ✓ .env.subscription: added the missing APP_PORT=${app_port}\033[0m"
+        fi
+    fi
+
+    cp "$COMPOSE_FILE" "${COMPOSE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    local before
+    before=$(grep -oE "127\.0\.0\.1:[0-9]+:\\\$\{APP_PORT:-3010\}" "$COMPOSE_FILE" | head -1)
+
+    sed -i -E "s|127\.0\.0\.1:[0-9]+:\\\$\{APP_PORT:-3010\}|127.0.0.1:${app_port}:${app_port}|g" "$COMPOSE_FILE"
+
+    echo -e "\033[38;5;244m  ✓ ${before}  →  127.0.0.1:${app_port}:${app_port}\033[0m"
+
+    # The bundled Caddy dials the container port; keep its .env in step.
+    if [ -f "$CADDY_DIR/.env" ]; then
+        local caddy_sub_port
+        caddy_sub_port=$(grep "^SUB_PORT=" "$CADDY_DIR/.env" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d "\"' ")
+        if [ -n "$caddy_sub_port" ] && [ "$caddy_sub_port" != "$app_port" ]; then
+            cp "$CADDY_DIR/.env" "$CADDY_DIR/.env.backup.$(date +%Y%m%d_%H%M%S)"
+            sed -i "s|^SUB_PORT=.*|SUB_PORT=${app_port}|" "$CADDY_DIR/.env"
+            echo -e "\033[38;5;244m  ✓ Caddy SUB_PORT: ${caddy_sub_port} → ${app_port}\033[0m"
+        fi
+    fi
+
+    echo -e "\033[1;32m✅ Subscription-page port mapping fixed\033[0m"
+    echo -e "\033[38;5;244m   Restart to apply: $APP_NAME restart\033[0m"
+}
+
+check_subpage_trust_proxy_migration_needed() {
+    [ -f "$SUB_ENV_FILE" ] || return 1
+    grep -q "^TRUST_PROXY=" "$SUB_ENV_FILE" 2>/dev/null && return 1
+    return 0
+}
+
+# ===== v6.6.0 Caddyfile migration =====
+#
+# Two defects in previously generated Caddyfiles:
+#
+# 1) /assets on a shared panel+subpage domain was load-balanced across both
+#    upstreams with `lb_policy first`. subscription-page 8.0.0 destroys the
+#    connection (no HTTP status) for /assets requests without a valid session
+#    cookie, so Caddy has nothing to fall back on and the panel dashboard
+#    answers 502 for every asset. Replaced by a Referer split: the panel's
+#    index.html sets <meta name="referrer" content="no-referrer">, so its asset
+#    requests carry no Referer, while the subscription page sends the full
+#    same-origin URL containing /<prefix>/.
+#
+# 2) Upstream hostnames were hardcoded to `remnawave` / `remnawave-subscription-page`,
+#    which are wrong on any install made with `--name`. Now taken from
+#    PANEL_HOST / SUB_HOST in $CADDY_DIR/.env.
+#
+# Only the Caddyfile is regenerated. $CADDY_DIR/.env is appended to, never
+# rewritten, so Caddy-security admin credentials keep matching the existing
+# /data users.json.
+
+check_caddyfile_migration_needed() {
+    [ -f "$CADDY_DIR/Caddyfile" ] || return 1
+
+    # Old two-upstream /assets block
+    grep -q "lb_policy first" "$CADDY_DIR/Caddyfile" 2>/dev/null && return 0
+
+    # Hardcoded upstream hostnames
+    grep -qE "reverse_proxy[[:space:]]+(http://)?remnawave(-subscription-page)?:" "$CADDY_DIR/Caddyfile" 2>/dev/null && return 0
+    grep -qE "to[[:space:]]+(http://)?remnawave(-subscription-page)?:" "$CADDY_DIR/Caddyfile" 2>/dev/null && return 0
+
+    return 1
+}
+
+migrate_caddyfile() {
+    [ -f "$CADDY_DIR/Caddyfile" ] || return 1
+
+    echo -e "\033[1;36m🔄 Regenerating Caddyfile (subscription-page 8.0.0 /assets handling)\033[0m"
+
+    local caddy_env="$CADDY_DIR/.env"
+    local panel_domain sub_domain sub_prefix secure_mode
+
+    # Simple mode stores PANEL_DOMAIN, secure mode REMNAWAVE_PANEL_DOMAIN
+    panel_domain=$(grep "^PANEL_DOMAIN=" "$caddy_env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d "\"' ")
+    [ -z "$panel_domain" ] && panel_domain=$(grep "^REMNAWAVE_PANEL_DOMAIN=" "$caddy_env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d "\"' ")
+    sub_domain=$(grep "^SUB_DOMAIN=" "$caddy_env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d "\"' ")
+    sub_prefix=$(grep "^SUB_PREFIX=" "$caddy_env" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d "\"' ")
+
+    if [ -z "$panel_domain" ]; then
+        echo -e "\033[1;33m⚠️  Could not read the panel domain from $caddy_env — skipping\033[0m"
+        echo -e "\033[38;5;244m   Regenerate manually with: $APP_NAME caddy\033[0m"
+        return 1
+    fi
+    [ -z "$sub_domain" ] && sub_domain="$panel_domain"
+    [ -z "$sub_prefix" ] && sub_prefix="sub"
+
+    secure_mode="false"
+    grep -q "authenticate with remnawaveportal" "$CADDY_DIR/Caddyfile" 2>/dev/null && secure_mode="true"
+
+    cp "$CADDY_DIR/Caddyfile" "$CADDY_DIR/Caddyfile.backup.$(date +%Y%m%d_%H%M%S)"
+
+    # Add the upstream hostnames the new Caddyfile references. Appending only —
+    # rewriting the file would regenerate AUTHP_ADMIN_SECRET and desync it from
+    # the users.json already stored in the caddy-ssl-data volume.
+    if ! grep -q "^PANEL_HOST=" "$caddy_env" 2>/dev/null; then
+        {
+            echo ""
+            echo "# Upstream container names on the docker network (container_name/hostname"
+            echo "# in the panel compose), not the compose service keys."
+            echo "PANEL_HOST=$APP_NAME"
+            echo "SUB_HOST=${APP_NAME}-subscription-page"
+        } >> "$caddy_env"
+        echo -e "\033[38;5;244m  ✓ Added PANEL_HOST / SUB_HOST to $caddy_env\033[0m"
+    fi
+
+    if [ "$secure_mode" = "true" ]; then
+        create_secure_caddyfile "$panel_domain" "$sub_domain" "$sub_prefix"
+    else
+        create_simple_caddyfile "$panel_domain" "$sub_domain" "$sub_prefix"
+    fi
+    echo -e "\033[38;5;244m  ✓ Caddyfile regenerated ($([ "$secure_mode" = "true" ] && echo "secure" || echo "simple") mode)\033[0m"
+
+    # Reload rather than restart: a config error must not take the proxy down.
+    if [ -d "$CADDY_DIR" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^caddy-remnawave$'; then
+        if docker exec caddy-remnawave caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+            echo -e "\033[1;32m✅ Caddy reloaded with the new configuration\033[0m"
+        else
+            echo -e "\033[1;33m⚠️  Caddy reload failed — restart it manually: cd $CADDY_DIR && docker compose restart\033[0m"
+        fi
+    else
+        echo -e "\033[38;5;244m   Caddy is not running; the new config applies on next start\033[0m"
+    fi
+}
+
+migrate_subpage_trust_proxy() {
+    [ -f "$SUB_ENV_FILE" ] || return 1
+
+    cp "$SUB_ENV_FILE" "${SUB_ENV_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    {
+        echo ""
+        echo "# Express \"trust proxy\": how the real client IP is resolved so it cannot"
+        echo "# be spoofed via X-Forwarded-For. 1 = one reverse proxy (Caddy/Nginx)."
+        echo "TRUST_PROXY=1"
+    } >> "$SUB_ENV_FILE"
+    echo -e "\033[38;5;244m  ✓ Added TRUST_PROXY=1 to .env.subscription\033[0m"
+}
+
 # ===== Panel v3.0.0 migration =====
 # v3 replaces JWT_AUTH_SECRET/JWT_API_TOKENS_SECRET with a single APP_SECRET
 # (value must be kept from JWT_AUTH_SECRET) and drops SWAGGER_PATH/SCALAR_PATH/
@@ -1290,9 +1491,141 @@ colorized_echo() {
     esac
 }
 
+# ===== Script self-delivery =================================================
+
+# Compare two dotted versions. Returns 0 when $1 >= $2.
+script_version_gte() {
+    [ "$1" = "$2" ] && return 0
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
+# Mirrors, most authoritative first. A --source override wins outright.
+script_mirror_urls() {
+    if [ "$SCRIPT_URL_OVERRIDDEN" = "true" ]; then
+        printf '%s\n' "$SCRIPT_URL"
+        return 0
+    fi
+    printf '%s\n' \
+        "https://raw.githubusercontent.com/${SCRIPT_REPO}/${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://cdn.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://fastly.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://gcore.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}" \
+        "https://testingcf.jsdelivr.net/gh/${SCRIPT_REPO}@${SCRIPT_REF}/${SCRIPT_FILE}"
+}
+
+# A downloaded file is only accepted as "our script" if it carries a shebang,
+# a version line, a plausible size, and — decisively — parses as bash. That
+# rejects captive-portal pages, CDN error bodies and truncated transfers, all
+# of which would otherwise be installed over a working script.
+script_download_is_valid() {
+    local file="$1"
+
+    [ -s "$file" ] || return 1
+    head -n1 "$file" | grep -q '^#!' || return 1
+    grep -q "^SCRIPT_VERSION=" "$file" || return 1
+    [ "$(wc -c < "$file" 2>/dev/null || echo 0)" -ge 20000 ] || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+
+    return 0
+}
+
+# Download the script into $1, trying every mirror. Sets SCRIPT_SOURCE_USED.
+fetch_script_file() {
+    local out="$1"
+    local url
+
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        if curl -fsSL --connect-timeout 7 --max-time 90 --retry 1 --retry-delay 1 \
+                "$url" -o "$out" 2>/dev/null && script_download_is_valid "$out"; then
+            SCRIPT_SOURCE_USED="$url"
+            return 0
+        fi
+        rm -f "$out" 2>/dev/null || true
+    done < <(script_mirror_urls)
+
+    return 1
+}
+
+# Version string of a downloaded script file.
+script_file_version() {
+    grep "^SCRIPT_VERSION=" "$1" 2>/dev/null | head -1 | cut -d'"' -f2
+}
+
+# Latest published version, or empty when every mirror is unreachable.
+get_remote_script_version() {
+    local tmp ver
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME:-remnawave}.ver.XXXXXX") || return 1
+    if fetch_script_file "$tmp"; then
+        ver=$(script_file_version "$tmp")
+        rm -f "$tmp"
+        printf '%s' "$ver"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# Install the running script fresh from the mirrors and hand control over to it
+# with the user's original arguments. Never asks: an outdated script cannot be
+# trusted to run the current migrations, so staying on it is not an option.
+#
+# REMNAWAVE_SELFUPDATE_DONE guards against a re-exec loop if the installed copy
+# still reports an old version (different install path, read-only /usr/local/bin).
+ensure_latest_script() {
+    local target_path="/usr/local/bin/${APP_NAME:-remnawave}"
+
+    [ "${REMNAWAVE_SELFUPDATE_DONE:-0}" = "1" ] && return 0
+    [ "$SCRIPT_URL_OVERRIDDEN" = "true" ] && return 0
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME:-remnawave}.upd.XXXXXX") || return 0
+
+    if ! fetch_script_file "$tmp"; then
+        rm -f "$tmp"
+        colorized_echo yellow "⚠️  Could not reach any script mirror — continuing with v$SCRIPT_VERSION"
+        return 0
+    fi
+
+    local remote_version
+    remote_version=$(script_file_version "$tmp")
+
+    if [ -z "$remote_version" ] || [ "$remote_version" = "$SCRIPT_VERSION" ] || \
+       ! script_version_gte "$remote_version" "$SCRIPT_VERSION"; then
+        rm -f "$tmp"
+        colorized_echo green "✅ Script is up to date (v$SCRIPT_VERSION)"
+        return 0
+    fi
+
+    colorized_echo yellow "🔄 Script update: v$SCRIPT_VERSION → v$remote_version (applying automatically)"
+    colorized_echo blue   "   Source: $SCRIPT_SOURCE_USED"
+
+    [ -d /usr/local/bin ] || mkdir -p /usr/local/bin 2>/dev/null || true
+
+    if ! install -m 755 "$tmp" "$target_path" 2>/dev/null; then
+        rm -f "$tmp"
+        colorized_echo yellow "⚠️  Could not write $target_path — continuing with v$SCRIPT_VERSION"
+        return 0
+    fi
+    rm -f "$tmp"
+
+    local installed_version
+    installed_version=$(grep "^SCRIPT_VERSION=" "$target_path" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [ "$installed_version" != "$remote_version" ]; then
+        colorized_echo yellow "⚠️  Update verification failed (expected v$remote_version, got v${installed_version:-unknown})"
+        return 0
+    fi
+
+    colorized_echo green "✅ Updated to v$installed_version — continuing"
+    echo
+
+    export REMNAWAVE_SELFUPDATE_DONE=1
+    exec "$target_path" "${SCRIPT_ORIGINAL_ARGS[@]}"
+}
+
 check_system_requirements() {
     local errors=0
-    
+
     # Проверяем свободное место (минимум 2GB для панели)
     local available_space=$(df / | awk 'NR==2 {print $4}')
     if [ "$available_space" -lt 2097152 ]; then  # 2GB в KB
@@ -1444,17 +1777,38 @@ install_remnawave_script() {
         mkdir -p /usr/local/bin  
     fi  
 
-    curl -sSL $SCRIPT_URL -o $TARGET_PATH
-    colorized_echo blue "Fetched remnawave script from $SCRIPT_URL"
+    # Download to a temp file and validate before touching $TARGET_PATH: a
+    # half-transferred file or a captive-portal page must never replace a
+    # working CLI. Falls through the mirror list (GitHub raw, then jsDelivr).
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.inst.XXXXXX") || {
+        colorized_echo red "Failed to create temporary file"
+        exit 1
+    }
 
-    chmod 755 $TARGET_PATH  
+    if fetch_script_file "$tmp"; then
+        if ! install -m 755 "$tmp" "$TARGET_PATH"; then
+            rm -f "$tmp"
+            colorized_echo red "Failed to install remnawave script at $TARGET_PATH"
+            exit 1
+        fi
+        rm -f "$tmp"
+        colorized_echo blue "Fetched remnawave script from $SCRIPT_SOURCE_USED"
+    else
+        rm -f "$tmp"
+        colorized_echo yellow "⚠️  Could not download the script from any mirror"
+        # Fall back to the copy we are executing right now — it is by definition
+        # a valid script of this exact version.
+        if [ ! -f "${BASH_SOURCE[0]}" ] || ! install -m 755 "${BASH_SOURCE[0]}" "$TARGET_PATH" 2>/dev/null; then
+            colorized_echo red "Failed to install remnawave script at $TARGET_PATH"
+            exit 1
+        fi
+        colorized_echo blue "Installed remnawave script v$SCRIPT_VERSION from the local copy"
+    fi
 
-    if [ -f "$TARGET_PATH" ]; then  
-        colorized_echo green "Remnawave script installed successfully at $TARGET_PATH"  
-    else  
-        colorized_echo red "Failed to install remnawave script at $TARGET_PATH"  
-        exit 1  
-    fi  
+    local installed_version
+    installed_version=$(grep "^SCRIPT_VERSION=" "$TARGET_PATH" 2>/dev/null | head -1 | cut -d'"' -f2)
+    colorized_echo green "Remnawave script v${installed_version:-$SCRIPT_VERSION} installed successfully at $TARGET_PATH"
 }
 
 # Функция для проверки и восстановления поврежденного backup-config.json
@@ -7852,7 +8206,7 @@ validate_domain_dns() {
 # ===== CADDY REVERSE PROXY FUNCTIONS =====
 
 CADDY_DIR="/opt/caddy-remnawave"
-CADDY_VERSION="2.10.2"
+CADDY_VERSION="2.11.4"
 
 # Check if web server is already installed
 check_existing_webserver() {
@@ -8217,6 +8571,14 @@ install_caddy_reverse_proxy() {
         caddy_image="remnawave/caddy-with-auth:latest"
     fi
     
+    # Snapshot the previous .env before overwriting it — the secure-mode block
+    # below needs the old AUTHP_ADMIN_SECRET to stay in step with users.json.
+    local caddy_env_backup=""
+    if [ -f "$CADDY_DIR/.env" ]; then
+        caddy_env_backup="$CADDY_DIR/.env.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$CADDY_DIR/.env" "$caddy_env_backup"
+    fi
+
     # Create .env file
     cat > "$CADDY_DIR/.env" << EOF
 # Caddy Reverse Proxy for Remnawave
@@ -8229,15 +8591,37 @@ SUB_DOMAIN=$sub_domain
 PANEL_PORT=$panel_port
 SUB_PORT=$sub_port
 SUB_PREFIX=$sub_prefix
+
+# Upstream container names on the docker network. These follow container_name/
+# hostname in the panel compose, which are derived from the install name — they
+# are NOT the compose service keys.
+PANEL_HOST=$APP_NAME
+SUB_HOST=${APP_NAME}-subscription-page
 EOF
 
     # Add security-specific env vars
     if [ "$secure_mode" = "true" ]; then
-        # Generate admin credentials
         local caddy_admin_user="admin"
         local caddy_admin_email="${caddy_admin_user}@${panel_domain}"
-        local caddy_admin_password=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)
-        
+        local caddy_admin_password=""
+
+        # AUTHP_ADMIN_SECRET only seeds the local identity store the FIRST time
+        # Caddy starts; afterwards the hash lives in users.json inside the
+        # caddy-ssl-data volume. Minting a new secret on a reinstall would print
+        # a password that does not open anything, so reuse the previous one
+        # whenever that volume (and therefore the user database) still exists.
+        if docker volume inspect caddy-ssl-data >/dev/null 2>&1; then
+            caddy_admin_password=$(grep "^AUTHP_ADMIN_SECRET=" "$caddy_env_backup" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d "\"' ")
+            if [ -n "$caddy_admin_password" ]; then
+                colorized_echo blue "🔑 Reusing the existing Caddy admin password (user database preserved)"
+            else
+                colorized_echo yellow "⚠️  caddy-ssl-data volume exists but no previous AUTHP_ADMIN_SECRET was found."
+                colorized_echo yellow "   A new password will be generated; if login fails, remove the volume:"
+                colorized_echo yellow "   cd $CADDY_DIR && docker compose down -v"
+            fi
+        fi
+        [ -z "$caddy_admin_password" ] && caddy_admin_password=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)
+
         cat >> "$CADDY_DIR/.env" << EOF
 
 # Caddy Security Settings
@@ -8253,7 +8637,7 @@ EOF
 
     colorized_echo green "✅ .env file created"
     
-    # Create docker-compose.yml - using remnawave-network like in docs
+    # Create docker-compose.yml — joins the panel network (${APP_NAME}-network)
     cat > "$CADDY_DIR/docker-compose.yml" << EOF
 services:
   caddy:
@@ -8266,7 +8650,7 @@ services:
       - "0.0.0.0:443:443"
       - "0.0.0.0:443:443/udp"  # HTTP/3 QUIC
     networks:
-      - remnawave-network
+      - ${APP_NAME}-network
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./logs:/var/log/caddy
@@ -8280,8 +8664,8 @@ services:
         max-file: "3"
 
 networks:
-  remnawave-network:
-    name: remnawave-network
+  ${APP_NAME}-network:
+    name: ${APP_NAME}-network
     driver: bridge
     external: true
 
@@ -8306,10 +8690,12 @@ EOF
     colorized_echo green "✅ Caddyfile created"
     echo
     
-    # Create remnawave-network if it doesn't exist
-    if ! docker network ls --format '{{.Name}}' | grep -q "^remnawave-network$"; then
-        colorized_echo blue "🔗 Creating remnawave-network..."
-        docker network create remnawave-network 2>/dev/null || true
+    # Create the panel network if it doesn't exist. The panel compose declares
+    # ${APP_NAME}-network, and Caddy joins it as external — the names must match,
+    # otherwise Caddy sits on its own bridge and cannot resolve the containers.
+    if ! docker network ls --format '{{.Name}}' | grep -q "^${APP_NAME}-network$"; then
+        colorized_echo blue "🔗 Creating ${APP_NAME}-network..."
+        docker network create "${APP_NAME}-network" 2>/dev/null || true
     fi
     
     # Start Caddy
@@ -8439,12 +8825,30 @@ https://{\$PANEL_DOMAIN} {
     # Enable compression (zstd preferred, gzip fallback)
     encode zstd gzip
 
-    # Assets - open for all (tries both subscription-page and panel)
+    # Assets — the panel and the subscription page BOTH serve /assets/*, so on a
+    # shared domain they have to be told apart per request.
+    #
+    # Load-balancing between the two upstreams does not work: subscription-page
+    # 8.0.0 destroys the connection (no HTTP status at all) for /assets requests
+    # without a valid session cookie, so there is nothing for Caddy to fall back on.
+    #
+    # The referrer is a reliable discriminator: the panel's index.html sets
+    # <meta name="referrer" content="no-referrer">, so panel asset requests carry
+    # NO Referer, while the subscription page sends the full same-origin URL
+    # (https://domain/${sub_prefix}/<shortUuid>).
+    @sub_assets {
+        path /assets/*
+        header Referer */${sub_prefix}/*
+    }
+    handle @sub_assets {
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT} {
+            header_up X-Real-IP {remote_host}
+            header_up Host {host}
+        }
+    }
+
     handle /assets/* {
-        reverse_proxy {
-            to remnawave-subscription-page:{\$SUB_PORT}
-            to remnawave:{\$PANEL_PORT}
-            lb_policy first
+        reverse_proxy {\$PANEL_HOST:remnawave}:{\$PANEL_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -8452,7 +8856,7 @@ https://{\$PANEL_DOMAIN} {
 
     # Subscription page routes - open for all
     handle /${sub_prefix}/* {
-        reverse_proxy remnawave-subscription-page:{\$SUB_PORT} {
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -8460,7 +8864,7 @@ https://{\$PANEL_DOMAIN} {
     
     # Panel - all other routes
     handle {
-        reverse_proxy remnawave:{\$PANEL_PORT} {
+        reverse_proxy {\$PANEL_HOST:remnawave}:{\$PANEL_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -8500,7 +8904,7 @@ https://{\$PANEL_DOMAIN} {
     # Enable compression (zstd preferred, gzip fallback)
     encode zstd gzip
 
-    reverse_proxy remnawave:{\$PANEL_PORT} {
+    reverse_proxy {\$PANEL_HOST:remnawave}:{\$PANEL_PORT} {
         header_up X-Real-IP {remote_host}
         header_up Host {host}
     }
@@ -8526,7 +8930,7 @@ https://{\$SUB_DOMAIN} {
     
     # Assets - explicitly handle for subscription page
     handle /assets/* {
-        reverse_proxy remnawave-subscription-page:{\$SUB_PORT} {
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -8534,7 +8938,7 @@ https://{\$SUB_DOMAIN} {
     
     # All other subscription paths
     handle {
-        reverse_proxy remnawave-subscription-page:{\$SUB_PORT} {
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -8629,26 +9033,37 @@ https://{$REMNAWAVE_PANEL_DOMAIN} {
 
     # API routes - open for integrations
     route /api/* {
-        reverse_proxy http://remnawave:{$PANEL_PORT}
+        reverse_proxy http://{$PANEL_HOST:remnawave}:{$PANEL_PORT}
     }
 
 EOF
         # Add subscription and assets routes (open for all)
-        cat >> "$CADDY_DIR/Caddyfile" << 'EOF'
-    # Assets - open for all (tries both subscription-page and panel)
-    route /assets/* {
-        reverse_proxy {
-            to remnawave-subscription-page:{$SUB_PORT}
-            to http://remnawave:{$PANEL_PORT}
-            lb_policy first
-        }
+        cat >> "$CADDY_DIR/Caddyfile" << EOF
+    # Assets — the panel and the subscription page BOTH serve /assets/*, so on a
+    # shared domain they have to be told apart per request.
+    #
+    # Load-balancing between the two upstreams does not work: subscription-page
+    # 8.0.0 destroys the connection (no HTTP status at all) for /assets requests
+    # without a valid session cookie, so there is nothing for Caddy to fall back on.
+    #
+    # The referrer is a reliable discriminator: the panel's index.html sets
+    # <meta name="referrer" content="no-referrer">, so panel asset requests carry
+    # NO Referer, while the subscription page sends the full same-origin URL.
+    @sub_assets {
+        path /assets/*
+        header Referer */${sub_prefix}/*
+    }
+    route @sub_assets {
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT}
     }
 
-EOF
-        cat >> "$CADDY_DIR/Caddyfile" << EOF
+    route /assets/* {
+        reverse_proxy http://{\$PANEL_HOST:remnawave}:{\$PANEL_PORT}
+    }
+
     # Subscription page routes - open for all
     route /${sub_prefix}/* {
-        reverse_proxy remnawave-subscription-page:{\$SUB_PORT}
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT}
     }
 
 EOF
@@ -8667,7 +9082,7 @@ EOF
     # All other routes - protected
     route /* {
         authorize with panelpolicy
-        reverse_proxy http://remnawave:{$PANEL_PORT}
+        reverse_proxy http://{$PANEL_HOST:remnawave}:{$PANEL_PORT}
     }
 
     log {
@@ -8751,7 +9166,7 @@ https://{$REMNAWAVE_PANEL_DOMAIN} {
 
     # API routes - open for integrations
     route /api/* {
-        reverse_proxy http://remnawave:{$PANEL_PORT}
+        reverse_proxy http://{$PANEL_HOST:remnawave}:{$PANEL_PORT}
     }
 
     # Auth portal
@@ -8768,7 +9183,7 @@ https://{$REMNAWAVE_PANEL_DOMAIN} {
     # All other routes - protected
     route /* {
         authorize with panelpolicy
-        reverse_proxy http://remnawave:{$PANEL_PORT}
+        reverse_proxy http://{$PANEL_HOST:remnawave}:{$PANEL_PORT}
     }
 
     log {
@@ -8792,7 +9207,7 @@ https://{$SUB_DOMAIN} {
     
     # Assets - explicitly handle for subscription page
     handle /assets/* {
-        reverse_proxy remnawave-subscription-page:{$SUB_PORT} {
+        reverse_proxy {$SUB_HOST:remnawave-subscription-page}:{$SUB_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -8800,7 +9215,7 @@ https://{$SUB_DOMAIN} {
     
     # All other subscription paths
     handle {
-        reverse_proxy remnawave-subscription-page:{$SUB_PORT} {
+        reverse_proxy {$SUB_HOST:remnawave-subscription-page}:{$SUB_PORT} {
             header_up X-Real-IP {remote_host}
             header_up Host {host}
         }
@@ -9753,6 +10168,30 @@ check_subpage_token_configured() {
 
 # ===== SUBSCRIPTION PAGE MANAGEMENT =====
 
+# Resolve the subscription-page SERVICE key from docker-compose.yml.
+#
+# Compose service keys and container names are two different things here: the
+# bundled panel compose keeps the upstream-style fixed keys (remnawave,
+# remnawave-db, remnawave-redis, remnawave-subscription-page) and only the
+# container_name/hostname carry $APP_NAME, while the standalone compose keys the
+# service by $APP_NAME. Passing the container name to `docker compose <cmd>`
+# silently matches nothing on a custom --name install, so read the key back.
+subpage_service_name() {
+    local compose="${1:-$COMPOSE_FILE}"
+    local name=""
+
+    if [ -f "$compose" ]; then
+        name=$(grep -oE '^[[:space:]]{1,8}[A-Za-z0-9_.-]+-subscription-page:[[:space:]]*$' "$compose" 2>/dev/null \
+               | head -1 | tr -d ' :')
+    fi
+
+    if [ -n "$name" ]; then
+        echo "$name"
+    else
+        echo "remnawave-subscription-page"
+    fi
+}
+
 subpage_command() {
     if [ ! -f "$COMPOSE_FILE" ]; then
         colorized_echo red "Remnawave is not installed!"
@@ -10022,8 +10461,8 @@ subpage_restart() {
     }
     
     # Stop and recreate
-    $COMPOSE -f "$COMPOSE_FILE" stop ${APP_NAME}-subscription-page 2>/dev/null
-    $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate ${APP_NAME}-subscription-page 2>/dev/null
+    $COMPOSE -f "$COMPOSE_FILE" stop "$(subpage_service_name)" 2>/dev/null
+    $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate "$(subpage_service_name)" 2>/dev/null
     
     if [ $? -eq 0 ]; then
         colorized_echo green "✅ subscription-page container restarted!"
@@ -10051,7 +10490,7 @@ subpage_logs() {
     echo -e "\033[38;5;244mPress Ctrl+C to exit\033[0m"
     echo
     
-    $COMPOSE -f "$COMPOSE_FILE" logs -f --tail=100 ${APP_NAME}-subscription-page
+    $COMPOSE -f "$COMPOSE_FILE" logs -f --tail=100 "$(subpage_service_name)"
 }
 
 # Quick restart command for CLI
@@ -10442,21 +10881,38 @@ SUB_ENV_FILE="$APP_DIR/.env.subscription"
 colorized_echo blue "Generating .env.subscription for subscription-page"
 cat > "$SUB_ENV_FILE" <<EOL
 ### Remnawave Panel URL, can be http://remnawave:3000 or https://panel.example.com
+### Must include the scheme — the subscription page rejects anything else.
 REMNAWAVE_PANEL_URL=http://${APP_NAME}:${APP_PORT}
 
 APP_PORT=${SUB_PAGE_PORT}
+
+### API Token — REQUIRED since subscription-page 7.0.0.
+### The installer fills this in automatically right after the panel starts
+### (Dashboard → Settings → API Tokens if you ever need to rotate it).
+REMNAWAVE_API_TOKEN=
 
 # Serve at custom root path, for example, this value can be: CUSTOM_SUB_PREFIX=sub
 # Do not place / at the start/end
 CUSTOM_SUB_PREFIX=${CUSTOM_SUB_PREFIX}
 
+# Express "trust proxy": how the real client IP is resolved so it cannot be
+# spoofed via X-Forwarded-For. 1 = exactly one reverse proxy (Caddy/Nginx)
+# in front of this container. Accepts true/false, a hop count, or a
+# comma-separated list of presets (loopback, linklocal, uniquelocal) / CIDRs.
+TRUST_PROXY=1
+
 # Support Marzban links
 #MARZBAN_LEGACY_LINK_ENABLED=false
 #MARZBAN_LEGACY_SECRET_KEY=
-#REMNAWAVE_API_TOKEN=
+#MARZBAN_LEGACY_SUBSCRIPTION_VALID_FROM=
+#MARZBAN_LEGACY_DROP_REVOKED_SUBSCRIPTIONS=false
 
-# If you use "Caddy with security" addon, you can place here X-Api-Key, which will be applied to requests to Remnawave Panel.
+# If you use "Caddy with security" addon or "Tiny Auth", you can place here X-Api-Key, which will be applied to requests to Remnawave Panel.
 #CADDY_AUTH_API_TOKEN=
+
+# If you use Cloudflare Zero Trust
+#CLOUDFLARE_ZERO_TRUST_CLIENT_ID=
+#CLOUDFLARE_ZERO_TRUST_CLIENT_SECRET=
 
 EOL
 colorized_echo green "Subscription environment saved in $SUB_ENV_FILE"
@@ -10535,8 +10991,12 @@ services:
         <<: [*common, *logging]
         env_file:
             - .env.subscription
+        # Both sides are fixed at generation time on purpose. Compose interpolates
+        # \${APP_PORT} from the PROJECT .env (the panel's, APP_PORT=3000) — never
+        # from a service's env_file — so a \${APP_PORT:-3010} here would publish
+        # the host port onto the panel's port and leave 127.0.0.1:${SUB_PAGE_PORT} dead.
         ports:
-            - '127.0.0.1:${SUB_PAGE_PORT}:\${APP_PORT:-3010}'
+            - '127.0.0.1:${SUB_PAGE_PORT}:${SUB_PAGE_PORT}'
         depends_on:
             remnawave:
                 condition: service_healthy
@@ -10691,9 +11151,46 @@ follow_remnawave_logs() {
 }
 
 update_remnawave_script() {
-    colorized_echo blue "Updating remnawave script"
-    curl -sSL $SCRIPT_URL | install -m 755 /dev/stdin /usr/local/bin/$APP_NAME
-    colorized_echo green "Remnawave script updated successfully"
+    local target_path="/usr/local/bin/$APP_NAME"
+    local old_version="unknown"
+    [ -f "$target_path" ] && old_version=$(grep "^SCRIPT_VERSION=" "$target_path" 2>/dev/null | head -1 | cut -d'"' -f2)
+
+    colorized_echo blue "Updating remnawave script (current: v${old_version:-unknown})"
+
+    # Never `curl | install /dev/stdin`: /dev/stdin is missing on minimal
+    # systems, and a failed transfer would silently leave the old file in place.
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX") || {
+        colorized_echo red "Failed to create temporary file"
+        return 1
+    }
+
+    if ! fetch_script_file "$tmp"; then
+        rm -f "$tmp"
+        colorized_echo red "Failed to download a valid script from any mirror"
+        return 1
+    fi
+
+    local new_version
+    new_version=$(script_file_version "$tmp")
+
+    if ! install -m 755 "$tmp" "$target_path"; then
+        rm -f "$tmp"
+        colorized_echo red "Failed to install updated script to $target_path"
+        return 1
+    fi
+    rm -f "$tmp"
+
+    local installed_version
+    installed_version=$(grep "^SCRIPT_VERSION=" "$target_path" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [ "$installed_version" != "$new_version" ]; then
+        colorized_echo red "Script update verification failed (expected v$new_version, got v${installed_version:-unknown})"
+        return 1
+    fi
+
+    colorized_echo blue "Fetched from $SCRIPT_SOURCE_USED"
+    colorized_echo green "Remnawave script updated successfully: v${old_version:-unknown} → v$installed_version"
+    return 0
 }
 
 update_remnawave() {
@@ -11157,7 +11654,7 @@ install_command() {
                         colorized_echo green "✅ API token created and saved!"
                         
                         colorized_echo blue "Starting subscription-page with API token..."
-                        if $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate ${APP_NAME}-subscription-page; then
+                        if $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate "$(subpage_service_name)"; then
                             colorized_echo green "✅ Subscription-page started with API token!"
                         else
                             colorized_echo yellow "⚠️  Subscription-page start had issues. Check with: $APP_NAME status"
@@ -11239,7 +11736,7 @@ EOF
                         colorized_echo green "✅ API token created and saved!"
                         
                         colorized_echo blue "Starting subscription-page with API token..."
-                        if $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate ${APP_NAME}-subscription-page; then
+                        if $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate "$(subpage_service_name)"; then
                             colorized_echo green "✅ Subscription-page started with API token!"
                         else
                             colorized_echo yellow "⚠️  Subscription-page start had issues. Check with: $APP_NAME status"
@@ -11347,7 +11844,7 @@ EOF
                     
                     # Recreate subscription-page container to apply token
                     colorized_echo blue "Starting subscription-page with API token..."
-                    if $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate ${APP_NAME}-subscription-page; then
+                    if $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate "$(subpage_service_name)"; then
                         colorized_echo green "✅ Subscription-page started with API token!"
                     else
                         colorized_echo yellow "⚠️  Subscription-page start had issues. Check with: $APP_NAME status"
@@ -11387,7 +11884,9 @@ EOF
     
     # Offer to install Caddy reverse proxy (only if user agreed earlier)
     if [[ "$INSTALL_CADDY_LATER" =~ ^[Yy]$ ]]; then
-        offer_caddy_installation "$FRONT_END_DOMAIN" "$SUB_DOMAIN" "$APP_PORT" "$SUB_PORT" "$CUSTOM_SUB_PREFIX"
+        # $SUB_PAGE_PORT — the port the subscription-page container listens on
+        # (SUB_PORT only ever exists inside the generated $CADDY_DIR/.env)
+        offer_caddy_installation "$FRONT_END_DOMAIN" "$SUB_DOMAIN" "$APP_PORT" "$SUB_PAGE_PORT" "$CUSTOM_SUB_PREFIX"
     else
         colorized_echo gray "💡 Tip: You can install Caddy later with: $APP_NAME caddy"
         echo
@@ -11559,7 +12058,7 @@ install_subpage_command() {
     echo
     
     # Check if subscription-page service exists in compose
-    if ! grep -q "${APP_NAME}-subscription-page:" "$COMPOSE_FILE" 2>/dev/null; then
+    if ! grep -qE '^[[:space:]]{1,8}[A-Za-z0-9_.-]+-subscription-page:[[:space:]]*$' "$COMPOSE_FILE" 2>/dev/null; then
         colorized_echo red "Subscription-page service not found in docker-compose.yml"
         colorized_echo yellow "This may require reinstalling: $APP_NAME install"
         exit 1
@@ -11568,35 +12067,103 @@ install_subpage_command() {
     # Check if .env.subscription exists
     if [ ! -f "$SUB_ENV_FILE" ]; then
         colorized_echo yellow "Creating $SUB_ENV_FILE..."
-        
-        # Get current panel URL from .env
-        local sub_public_url=$(grep "^SUB_PUBLIC_URL=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2)
-        if [ -z "$sub_public_url" ]; then
-            read -p "Enter subscription page public URL (e.g., https://sub.domain.com): " -r sub_public_url
+
+        # subscription-page hard-requires REMNAWAVE_PANEL_URL (must start with
+        # http:// or https://) and a non-empty REMNAWAVE_API_TOKEN — its config
+        # schema rejects anything else and the container exits on startup.
+        local panel_port=$(grep "^APP_PORT=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d '=' -f2 | tr -d '"'"'"' ')
+        panel_port="${panel_port:-3000}"
+        local metrics_port=$(grep "^METRICS_PORT=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d '=' -f2 | tr -d '"'"'"' ')
+        metrics_port="${metrics_port:-3001}"
+
+        # Read the published port straight off the subscription-page service block
+        # rather than scanning the whole file: older generated compose files list
+        # the panel and metrics ports as literals too, and a positional guess
+        # picks up the metrics port instead.
+        local sub_page_port
+        sub_page_port=$(awk '
+            /^[[:space:]]*[A-Za-z0-9_.-]+-subscription-page:[[:space:]]*$/ { inblock=1; next }
+            inblock && /^[[:space:]]{0,4}[A-Za-z0-9_.-]+:[[:space:]]*$/ { inblock=0 }
+            inblock && match($0, /127\.0\.0\.1:[0-9]+:/) {
+                s = substr($0, RSTART, RLENGTH); split(s, a, ":"); print a[2]; exit
+            }
+        ' "$COMPOSE_FILE" 2>/dev/null)
+        sub_page_port="${sub_page_port:-3010}"
+
+        local sub_prefix="sub"
+        if [ -t 0 ]; then
+            local sub_prefix_input=""
+            read -p "Subscription path prefix (CUSTOM_SUB_PREFIX) [sub, '-' for none]: " -r sub_prefix_input
+            case "$sub_prefix_input" in
+                "")  sub_prefix="sub" ;;
+                "-") sub_prefix="" ;;
+                *)   sub_prefix="$sub_prefix_input" ;;
+            esac
         fi
-        
+
+        # Required since subscription-page 7.0.0 (zod .min(1)): an empty token
+        # makes the container exit on startup, so there is nothing to fall back to.
+        local api_token=""
+        if [ -t 0 ]; then
+            local token_tries=0
+            while [ -z "$api_token" ] && [ "$token_tries" -lt 5 ]; do
+                read -p "Enter Remnawave API token (Dashboard → Settings → API Tokens): " -r api_token
+                token_tries=$((token_tries + 1))
+                if [ -z "$api_token" ]; then
+                    colorized_echo red "   REMNAWAVE_API_TOKEN is required — the container will not start without it."
+                fi
+            done
+        fi
+        if [ -z "$api_token" ]; then
+            colorized_echo red "❌ REMNAWAVE_API_TOKEN is required and was not provided."
+            colorized_echo yellow "   Create one in the panel (Settings → API Tokens) and re-run: $APP_NAME install-subpage"
+            exit 1
+        fi
+
         # Create .env.subscription
         cat > "$SUB_ENV_FILE" << EOF
-# Subscription Page Configuration
-# Created by install-subpage command
+### Subscription Page Configuration
+### Created by install-subpage command
 
-# API Token - Get from Remnawave Panel → Settings → API Tokens
-REMNAWAVE_API_TOKEN=
+### Remnawave Panel URL — reached over the docker network, must include the scheme
+REMNAWAVE_PANEL_URL=http://${APP_NAME}:${panel_port}
 
-# Subscription Page Public URL
-SUB_PUBLIC_URL=$sub_public_url
+### Port the container listens on (must match the compose port mapping)
+APP_PORT=${sub_page_port}
+
+### API Token — Remnawave Dashboard → Settings → API Tokens (REQUIRED)
+REMNAWAVE_API_TOKEN=${api_token}
+
+# Serve at custom root path, for example: CUSTOM_SUB_PREFIX=sub
+# Do not place / at the start/end
+CUSTOM_SUB_PREFIX=${sub_prefix}
+
+# Express "trust proxy": how many reverse-proxy hops to trust when resolving
+# the real client IP. 1 = a single proxy (Caddy/Nginx) in front of this app.
+TRUST_PROXY=1
+
+# If you use "Caddy with security" / "Tiny Auth", put the X-Api-Key here
+#CADDY_AUTH_API_TOKEN=
+
+# If you use Cloudflare Zero Trust
+#CLOUDFLARE_ZERO_TRUST_CLIENT_ID=
+#CLOUDFLARE_ZERO_TRUST_CLIENT_SECRET=
+
+# Support Marzban links
+#MARZBAN_LEGACY_LINK_ENABLED=false
+#MARZBAN_LEGACY_SECRET_KEY=
 EOF
         colorized_echo green "✅ Created $SUB_ENV_FILE"
     else
         colorized_echo green "✅ $SUB_ENV_FILE already exists"
     fi
-    
+
     # Pull and start subscription-page container
     colorized_echo blue "Pulling subscription-page image..."
-    $COMPOSE -f "$COMPOSE_FILE" pull ${APP_NAME}-subscription-page
+    $COMPOSE -f "$COMPOSE_FILE" pull "$(subpage_service_name)"
     
     colorized_echo blue "Starting subscription-page container..."
-    $COMPOSE -f "$COMPOSE_FILE" up -d ${APP_NAME}-subscription-page
+    $COMPOSE -f "$COMPOSE_FILE" up -d "$(subpage_service_name)"
     
     colorized_echo green "==================================================="
     colorized_echo green "✅ Subscription-page container installed!"
@@ -11719,8 +12286,26 @@ install_subpage_standalone_command() {
     echo -e "\033[1;37m🔑 API Token:\033[0m"
     echo -e "\033[38;5;244mGet token from panel: Settings → API Tokens → Create new token\033[0m"
     echo
-    read -p "Enter API token (or leave empty to configure later): " -r api_token
-    
+    # Required since subscription-page 7.0.0: the config schema rejects an empty
+    # REMNAWAVE_API_TOKEN and the container exits on startup, so do not let the
+    # install "succeed" into an immediate crash loop. Bounded, and never looping
+    # on a closed stdin — a `read` that cannot block would spin at 100% CPU.
+    if [ -t 0 ]; then
+        local token_tries=0
+        while [ -z "$api_token" ] && [ "$token_tries" -lt 5 ]; do
+            read -p "Enter API token: " -r api_token
+            token_tries=$((token_tries + 1))
+            if [ -z "$api_token" ]; then
+                colorized_echo red "   Required — the subscription page will not start without it."
+            fi
+        done
+    fi
+    if [ -z "$api_token" ]; then
+        colorized_echo red "❌ API token is required for a standalone subscription page."
+        colorized_echo yellow "   Create one in the panel (Settings → API Tokens) and run the install again."
+        exit 1
+    fi
+
     echo
     echo -e "\033[1;37m🌐 Subscription Page Domain:\033[0m"
     read -p "Enter domain for subscription page (e.g., sub.domain.com): " -r sub_domain
@@ -11734,9 +12319,43 @@ install_subpage_standalone_command() {
     read -p "Enter subscription path prefix (default: sub): " -r sub_prefix
     sub_prefix="${sub_prefix:-sub}"
     
-    # Port for subscription page
+    # Port for subscription page. The compose file publishes it on loopback so a
+    # host-level reverse proxy can reach the page, so a busy port is a hard
+    # `docker compose up` failure — pick a free one instead of failing later.
     local sub_port="${SUB_PAGE_PORT:-3010}"
-    
+    get_occupied_ports
+    if is_port_occupied "$sub_port"; then
+        colorized_echo yellow "⚠️  Port $sub_port is already in use."
+        if [ -t 0 ]; then
+            while true; do
+                read -p "   Enter another port for the subscription page: " -r sub_port_input
+                sub_port_input="${sub_port_input:-$sub_port}"
+                if [[ ! "$sub_port_input" =~ ^[0-9]+$ ]] || [ "$sub_port_input" -lt 1 ] || [ "$sub_port_input" -gt 65535 ]; then
+                    colorized_echo red "   Invalid port. Enter a number between 1 and 65535."
+                elif is_port_occupied "$sub_port_input"; then
+                    colorized_echo red "   Port $sub_port_input is also in use."
+                else
+                    sub_port="$sub_port_input"
+                    break
+                fi
+            done
+        else
+            local candidate=$sub_port
+            local attempts=0
+            while [ $attempts -lt 50 ] && is_port_occupied "$candidate"; do
+                candidate=$((candidate + 1))
+                attempts=$((attempts + 1))
+            done
+            if [ $attempts -lt 50 ]; then
+                sub_port=$candidate
+            else
+                colorized_echo red "❌ Could not find a free port near ${SUB_PAGE_PORT:-3010}."
+                exit 1
+            fi
+        fi
+        colorized_echo green "✅ Using port $sub_port for the subscription page"
+    fi
+
     echo
     colorized_echo blue "📁 Creating directory $APP_DIR..."
     mkdir -p "$APP_DIR"
@@ -11763,12 +12382,23 @@ APP_PORT=$sub_port
 # Custom subscription prefix path (without leading/trailing slashes)
 CUSTOM_SUB_PREFIX=$sub_prefix
 
-# API Token from Remnawave Panel (Settings → API Tokens)
+# API Token from Remnawave Panel (Settings → API Tokens) — REQUIRED
 REMNAWAVE_API_TOKEN=$api_token
+
+# Express "trust proxy": how many reverse-proxy hops to trust when resolving the
+# real client IP. 1 = a single proxy (Caddy/Nginx) in front of this container.
+TRUST_PROXY=1
 
 # Support Marzban links (optional)
 #MARZBAN_LEGACY_LINK_ENABLED=false
 #MARZBAN_LEGACY_SECRET_KEY=
+
+# If you use "Caddy with security" / "Tiny Auth"
+#CADDY_AUTH_API_TOKEN=
+
+# If you use Cloudflare Zero Trust
+#CLOUDFLARE_ZERO_TRUST_CLIENT_ID=
+#CLOUDFLARE_ZERO_TRUST_CLIENT_SECRET=
 EOF
     colorized_echo green "✅ Created $SUB_ENV_FILE"
     
@@ -11866,6 +12496,11 @@ services:
         restart: always
         env_file:
             - .env.subscription
+        # Published on loopback so a host-level reverse proxy (or a health check)
+        # can reach it. The bundled Caddy talks to the container over the docker
+        # network instead and does not depend on this mapping.
+        ports:
+            - '127.0.0.1:${sub_port}:${sub_port}'
         logging:
             driver: "json-file"
             options:
@@ -11967,9 +12602,13 @@ install_caddy_for_standalone_subpage() {
 SUB_DOMAIN=$sub_domain
 SUB_PORT=$sub_port
 SUB_PREFIX=$sub_prefix
+
+# Upstream container name on the docker network (container_name/hostname in the
+# standalone compose), not the compose service key.
+SUB_HOST=${APP_NAME}-subscription-page
 EOF
     colorized_echo green "✅ .env file created"
-    
+
     # Create docker-compose.yml for Caddy
     cat > "$CADDY_DIR/docker-compose.yml" << EOF
 services:
@@ -12031,12 +12670,12 @@ https://{\$SUB_DOMAIN} {
     
     # Health check endpoint
     handle /health {
-        reverse_proxy ${APP_NAME}-subscription-page:{\$SUB_PORT}
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT}
     }
     
     # All requests go to subscription-page
     handle /* {
-        reverse_proxy ${APP_NAME}-subscription-page:{\$SUB_PORT} {
+        reverse_proxy {\$SUB_HOST:remnawave-subscription-page}:{\$SUB_PORT} {
             header_up X-Real-IP {remote_host}
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
@@ -13369,22 +14008,11 @@ update_command() {
     echo -e "\033[38;5;8m$(printf '─%.0s' $(seq 1 50))\033[0m"
     
     # === ШАГ 1: Проверка обновлений скрипта ===
-    local current_script_version="$SCRIPT_VERSION"
     echo -e "\033[38;5;250m📝 Step 1:\033[0m Checking for script updates..."
-    local remote_script_version=$(curl -s --connect-timeout 5 "$SCRIPT_URL" 2>/dev/null | grep "^SCRIPT_VERSION=" | cut -d'"' -f2)
-    
-    if [ -n "$remote_script_version" ] && [ "$remote_script_version" != "$current_script_version" ]; then
-        echo -e "\033[1;33m🔄 Script update available: \033[38;5;15mv$current_script_version\033[0m → \033[1;37mv$remote_script_version\033[0m"
-        read -p "Do you want to update the script first? (y/n): " -r update_script
-        if [[ $update_script =~ ^[Yy]$ ]]; then
-            update_remnawave_script
-            echo -e "\033[1;32m✅ Script updated to v$remote_script_version\033[0m"
-            echo -e "\033[38;5;8m   Please run the update command again to continue\033[0m"
-            exit 0
-        fi
-    else
-        echo -e "\033[1;32m✅ Script is up to date (v$current_script_version)\033[0m"
-    fi
+    # Applies a newer script and re-execs into it with the same arguments — no
+    # prompt, no "please run update again". Migrations only ship with the script,
+    # so running an update from an outdated copy is never the right outcome.
+    ensure_latest_script
     
     cd "$APP_DIR" 2>/dev/null || { echo -e "\033[1;31m❌ Cannot access app directory\033[0m"; exit 1; }
 
@@ -13479,6 +14107,18 @@ update_command() {
         fi
         if [ "$has_compose_v588_migration" = true ]; then
             migrate_compose_v588
+        fi
+
+        # v6.6.0: broken subscription-page port mapping / missing TRUST_PROXY
+        if check_subpage_compose_ports_migration_needed; then
+            migrate_subpage_compose_ports
+        fi
+        if check_subpage_trust_proxy_migration_needed; then
+            migrate_subpage_trust_proxy
+        fi
+        # v6.6.0: /assets routing + upstream hostnames in an existing Caddyfile
+        if check_caddyfile_migration_needed; then
+            migrate_caddyfile
         fi
 
         # v3.0.0: очистка legacy-переменных (только если панель уже работает на v3)
@@ -13584,6 +14224,23 @@ update_command() {
     # v5.8.8 docker-compose migration (Valkey 9, socket)
     if check_compose_v588_migration_needed; then
         migrate_compose_v588
+        env_migrated=true
+    fi
+    # v6.6.0: subscription-page port mapping resolved ${APP_PORT} from the panel
+    # .env, leaving the published host port pointing at a dead container port
+    if check_subpage_compose_ports_migration_needed; then
+        migrate_subpage_compose_ports
+        env_migrated=true
+    fi
+    # v6.6.0: subscription-page needs TRUST_PROXY to resolve the real client IP
+    if check_subpage_trust_proxy_migration_needed; then
+        migrate_subpage_trust_proxy
+        env_migrated=true
+    fi
+    # v6.6.0: subscription-page 8.0.0 drops /assets connections without a valid
+    # session cookie, so the old lb_policy-based Caddy block 502s the dashboard
+    if check_caddyfile_migration_needed; then
+        migrate_caddyfile
         env_migrated=true
     fi
     # v3.0.0 .env migration (APP_SECRET replaces JWT secrets) — version-checked:
@@ -14023,22 +14680,11 @@ standalone_uninstall_command() {
 }
 
 main_menu() {
-    # Check for script updates on first menu display
-    local remote_script_version=$(curl -s --connect-timeout 3 "$SCRIPT_URL" 2>/dev/null | grep "^SCRIPT_VERSION=" | head -1 | cut -d'"' -f2)
-    if [ -n "$remote_script_version" ] && [ "$remote_script_version" != "$SCRIPT_VERSION" ]; then
-        echo
-        echo -e "\033[1;33m📦 New version available: v$remote_script_version (current: v$SCRIPT_VERSION)\033[0m"
-        read -r -p "Update now? (y/n) " update_choice
-        if [[ "$update_choice" =~ ^[Yy]$ ]]; then
-            colorized_echo blue "Updating script..."
-            curl -sSL $SCRIPT_URL | install -m 755 /dev/stdin /usr/local/bin/$APP_NAME
-            colorized_echo green "✅ Script updated successfully! Restarting..."
-            sleep 1
-            exec "$APP_NAME" "$@"
-        fi
-        echo
-    fi
-    
+    # Pull in a newer script before showing the menu. Applied without asking and
+    # re-exec'd in place: every menu action below assumes the current migrations
+    # and generators, which only exist in the current script.
+    ensure_latest_script
+
     while true; do
         clear
         # Header with language indicator

@@ -79,6 +79,20 @@ remnawave backup       # бэкап вручную (или `schedule` — по �
 | `subpage` / `subpage-token` / `subpage-restart` | Управление subscription-page |
 | `install-subpage-standalone --with-caddy` | Subpage на отдельном сервере |
 | `caddy …` | Установка и управление Caddy (`up/down/logs/edit/reset-user`) |
+| `install-script` / `update-script` | Установить или обновить **сам CLI** — контейнеры не трогаются |
+| `uninstall-script` | Удалить CLI из `/usr/local/bin` |
+
+> `install-script` — это не `install`. Она только ставит (или обновляет) команду `remnawave` на
+> сервере: пригодится до установки панели, на машине, которой вы управляете удалённо, или чтобы
+> прямо сейчас получить свежий CLI. `install` разворачивает саму панель.
+> `update` и так обновляет CLI перед всем остальным, поэтому вручную это нужно редко.
+> Все загрузки идут сначала через GitHub, потом через зеркала jsDelivr.
+
+```bash
+sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnawave.sh) @ install-script
+# GitHub заблокирован? то же самое через зеркало:
+sudo bash <(curl -Ls https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main/remnawave.sh) @ install-script
+```
 
 </details>
 
@@ -137,6 +151,19 @@ remnanode xray_log_err    # ошибки Xray в реальном времени
 | `core-update` | Обновление Xray-core |
 | `xray_log_out` / `xray_log_err` | Логи Xray в реальном времени |
 | `setup-logs` / `auto-restart` | Ротация логов / автоперезапуск по расписанию |
+| `install-script` | Установить или обновить **сам CLI** — контейнеры не трогаются |
+| `uninstall-script` | Удалить CLI из `/usr/local/bin` |
+
+> `install-script` — это не `install`. Она только ставит (или обновляет) команду `remnanode` на
+> сервере: пригодится до установки ноды или чтобы прямо сейчас получить свежий CLI. `install`
+> разворачивает сам контейнер ноды. `update` и так сначала обновляет CLI, поэтому вручную это нужно
+> редко.
+
+```bash
+sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install-script
+# GitHub заблокирован? то же самое через зеркало:
+sudo bash <(curl -Ls https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main/remnanode.sh) @ install-script
+```
 
 ```text
 /opt/remnanode/            # .env, docker-compose.yml

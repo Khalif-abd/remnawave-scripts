@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Remnawave Panel Installation Script
 # This script installs and manages Remnawave Panel
-# VERSION=6.6.0
+# VERSION=6.6.1
 
-SCRIPT_VERSION="6.6.0"
+SCRIPT_VERSION="6.6.1"
 BACKUP_SCRIPT_VERSION="1.5.0"  # Версия backup скрипта создаваемого Schedule функцией
 
 # Original invocation, captured before any shifting, so a self-update can
@@ -14977,14 +14977,21 @@ usage() {
     printf "   \033[38;5;117m%-18s\033[0m %s\n" "pm2-monitor" "📊 PM2 process monitor"
     echo
 
-    echo -e "\033[1;37m� Standalone Subscription-Page:\033[0m"
+    echo -e "\033[1;37m🌐 Standalone Subscription-Page:\033[0m"
     printf "   \033[38;5;214m%-24s\033[0m %s\n" "install-subpage-standalone" "🌐 Install subpage on separate server"
     printf "   \033[38;5;214m%-24s\033[0m %s\n" "caddy-standalone" "🔒 Install Caddy for standalone subpage"
     echo
 
-    echo -e "\033[1;37m�📊 Script Management:\033[0m"
-    printf "   \033[38;5;244m%-18s\033[0m %s\n" "install-script" "📥 Install this script globally"
-    printf "   \033[38;5;244m%-18s\033[0m %s\n" "uninstall-script" "📤 Remove script from system"
+    echo -e "\033[1;37m📊 Script Management:\033[0m"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "install-script" "📥 Install/refresh the CLI itself (no containers touched)"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "update-script" "🔄 Same thing, phrased as an update"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "uninstall-script" "📤 Remove the CLI from /usr/local/bin"
+    echo
+    echo -e "\033[38;5;244m   💡 These only touch this CLI — never the panel containers. Use them\033[0m"
+    echo -e "\033[38;5;244m      on a server that has no panel yet, or to force the newest CLI now:\033[0m"
+    echo -e "\033[38;5;244m         sudo $APP_NAME install-script\033[0m"
+    echo -e "\033[38;5;244m      Downloads go through GitHub, then jsDelivr mirrors. 'update' also\033[0m"
+    echo -e "\033[38;5;244m      refreshes the CLI on its own before touching anything else.\033[0m"
     echo
 
     echo -e "\033[1;37m🌐 Caddy Reverse Proxy:\033[0m"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Version: 4.5.0
+# Version: 4.5.1
 set -e
-SCRIPT_VERSION="4.5.0"
+SCRIPT_VERSION="4.5.1"
 
 # Original invocation, captured before any shifting, so a self-update can
 # re-exec the new script with exactly the command the user typed.
@@ -1901,8 +1901,14 @@ install_script_command() {
     check_running_as_root
     colorized_echo blue "Installing RemnaNode script globally"
     install_remnanode_script
+
+    # Report what actually landed on disk — install_remnanode_script fetches the
+    # newest published script, which is usually not the version running here.
+    local installed_version
+    installed_version=$(grep "^SCRIPT_VERSION=" "/usr/local/bin/$APP_NAME" 2>/dev/null | head -1 | cut -d'"' -f2)
+
     colorized_echo green "✅ Script installed successfully!"
-    colorized_echo white "   Version: $SCRIPT_VERSION"
+    colorized_echo white "   Version: ${installed_version:-$SCRIPT_VERSION}"
     colorized_echo white "   Location: /usr/local/bin/$APP_NAME"
     colorized_echo white "You can now run '$APP_NAME' from anywhere"
 }
@@ -4590,6 +4596,18 @@ usage() {
     printf "   \033[38;5;178m%-18s\033[0m %s\n" "ports" "🔌 Show ports configuration"
     printf "   \033[38;5;178m%-18s\033[0m %s\n" "enable-socket" "🔗 Enable selfsteal socket access"
     printf "   \033[38;5;178m%-18s\033[0m %s\n" "auto-restart" "⏰ Configure scheduled auto-restart"
+    echo
+
+    echo -e "\033[1;37m📊 Script Management:\033[0m"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "install-script" "📥 Install/refresh the CLI itself (no containers touched)"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "uninstall-script" "📤 Remove the CLI from /usr/local/bin"
+    echo
+    echo -e "\033[38;5;244m   💡 'install-script' only installs this CLI — it never installs or\033[0m"
+    echo -e "\033[38;5;244m      upgrades the node container. Use it on a server that has no\033[0m"
+    echo -e "\033[38;5;244m      node yet, or to force the newest CLI right now:\033[0m"
+    echo -e "\033[38;5;244m         sudo $APP_NAME install-script\033[0m"
+    echo -e "\033[38;5;244m      Downloads go through GitHub, then jsDelivr mirrors. 'update' also\033[0m"
+    echo -e "\033[38;5;244m      refreshes the CLI on its own before touching anything else.\033[0m"
     echo
 
     echo -e "\033[1;37m📋 Information:\033[0m"

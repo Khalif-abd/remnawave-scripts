@@ -79,6 +79,20 @@ remnawave backup       # manual backup (or `schedule` for cron)
 | `subpage` / `subpage-token` / `subpage-restart` | Subscription-page management |
 | `install-subpage-standalone --with-caddy` | Subpage on a separate server |
 | `caddy …` | Caddy install & management (`up/down/logs/edit/reset-user`) |
+| `install-script` / `update-script` | Install or refresh **the CLI itself** — no containers touched |
+| `uninstall-script` | Remove the CLI from `/usr/local/bin` |
+
+> `install-script` is not `install`. It only puts (or refreshes) the `remnawave` command on the
+> server — useful before the panel exists, on a box you only manage remotely, or to force the newest
+> CLI right now. `install` sets up the panel itself.
+> `update` refreshes the CLI on its own before doing anything else, so you rarely need to call these
+> by hand. All downloads try GitHub first, then jsDelivr mirrors.
+
+```bash
+sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnawave.sh) @ install-script
+# GitHub blocked? same thing via a mirror:
+sudo bash <(curl -Ls https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main/remnawave.sh) @ install-script
+```
 
 </details>
 
@@ -137,6 +151,18 @@ remnanode xray_log_err    # real-time Xray errors
 | `core-update` | Xray-core update |
 | `xray_log_out` / `xray_log_err` | Real-time Xray logs |
 | `setup-logs` / `auto-restart` | Log rotation / scheduled auto-restart |
+| `install-script` | Install or refresh **the CLI itself** — no containers touched |
+| `uninstall-script` | Remove the CLI from `/usr/local/bin` |
+
+> `install-script` is not `install`. It only puts (or refreshes) the `remnanode` command on the
+> server — useful before a node exists, or to force the newest CLI right now. `install` sets up the
+> node container. `update` refreshes the CLI on its own first, so you rarely need this by hand.
+
+```bash
+sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install-script
+# GitHub blocked? same thing via a mirror:
+sudo bash <(curl -Ls https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main/remnanode.sh) @ install-script
+```
 
 ```text
 /opt/remnanode/            # .env, docker-compose.yml

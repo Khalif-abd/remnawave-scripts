@@ -29,6 +29,11 @@ bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode
 bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
 ```
 
+> **GitHub blocked on your server?** Every script mirrors itself through jsDelivr, so use any of these
+> instead of `github.com/.../raw/main/`:
+> `https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main/<script>.sh`
+> Once installed, the scripts fall back to those mirrors on their own — including for self-updates.
+
 After installation each script is a global command: `remnawave`, `remnanode`, `selfsteal` — run without arguments to open the interactive menu.
 
 ## 📦 Scripts
@@ -112,10 +117,18 @@ remnanode xray_log_err    # real-time Xray errors
 |---|---|
 | `--force`, `-f` | Skip confirmations (for automation) |
 | `--secret-key=KEY` | SECRET_KEY from the Panel (required with `--force`) |
-| `--port=PORT` / `--xtls-port=PORT` | NODE_PORT (3000) / XTLS_API_PORT (61000) |
+| `--port=PORT` / `--xtls-port=PORT` | NODE_PORT (3000) / legacy XTLS_API_PORT (61000, ignored by node 2.8.0+) |
 | `--xray` / `--no-xray` | Whether to install Xray-core |
 | `--name NAME` / `--dev` | Directory name / dev image |
-| `--tag VERSION` | Pin the node image, e.g. `--tag 2.8.0` — stay on 2.x while the panel is not updated yet. Exact versions only: the node has no floating `2`/`3` tags. A pinned node is not moved by `update` |
+| `--tag VERSION` | Pin the node image, e.g. `--tag 3.2.2`. Exact versions only: the node has no floating `2`/`3` tags. A pinned node is not moved by `update`; `update --tag VERSION` re-pins an existing install |
+
+> ⚠️ **Node 3.3.0+ requires panel 3.3.0+.** Since 3.3.0 the node rejects the TLS handshake unless the
+> panel presents a derived SNI, so a newer node on an older panel just shows up as offline
+> (`unknown sni` in the node logs). Still on panel 3.2.x? Install or update with `--tag 3.2.2`.
+> The installer asks about this once and remembers the answer.
+>
+> `up` / `restart` never change the running image — only `update` does. The CLI itself, on the other
+> hand, keeps itself current automatically (mirrored via jsDelivr when GitHub is unreachable).
 
 | Command | Description |
 |---|---|

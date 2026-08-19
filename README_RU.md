@@ -4,8 +4,9 @@
 
 [![Лицензия MIT](https://img.shields.io/badge/Лицензия-MIT-yellow.svg)](./LICENSE)
 [![Shell](https://img.shields.io/badge/Язык-Bash-blue.svg)](#)
-[![Версия](https://img.shields.io/badge/remnawave.sh-6.4.0-blue.svg)](#)
-[![Panel v3](https://img.shields.io/badge/Remnawave_Panel-v3_ready-brightgreen.svg)](#)
+[![remnawave.sh](https://img.shields.io/badge/remnawave.sh-6.6.1-blue.svg)](#-remnawave-panel)
+[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.5.1-blue.svg)](#-remnanode)
+[![Panel](https://img.shields.io/badge/Remnawave_Panel-3.3.0_ready-brightgreen.svg)](#)
 [![Локализация](https://img.shields.io/badge/🌐-RU_|_EN-green.svg)](./README.md)
 
 **[English](./README.md)** · **[Быстрый старт](#-быстрый-старт)** · **[Скрипты](#-скрипты)** · **[Бэкапы](#-бэкапы-и-миграция)** · **[Поддержка](https://gig.ovh/t/remnawave-managment-scripts-by-dignezzz/116)**
@@ -14,7 +15,13 @@
 
 Однострочная установка и полноценный CLI для **Remnawave Panel**, **RemnaNode**, маскировки **Reality**, **WARP/Tor** и корпоративных бэкапов. Всё на Docker, интерфейс RU/EN, идемпотентные операции, автообновление.
 
-> 🆕 **Remnawave Panel v3.0.0 поддерживается из коробки.** Свежие установки сразу получают v3-конфигурацию, а `remnawave update` сам мигрирует `.env` при переходе с v2 — с проверкой версии образа и бэкапом каждого изменённого файла.
+> 🆕 **Remnawave Panel 3.3.0 и node 3.3.0 поддерживаются из коробки.** Свежие установки сразу
+> получают актуальную конфигурацию, а `remnawave update` сам мигрирует старый `.env` — с проверкой
+> версии образа и бэкапом каждого изменённого файла.
+>
+> ⚠️ **Нода 3.3.0+ работает только с панелью 3.3.0+** (нода теперь требует производный SNI в
+> TLS-handshake). `remnanode` спрашивает об этом один раз; если панель ещё на 3.2.x — ставьте с
+> `--tag 3.2.2`.
 
 ## ⚡ Быстрый старт
 
@@ -29,6 +36,14 @@ bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode
 bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
 ```
 
+Нужен только CLI, без установки всего остального? Замените `install` на **`install-script`** — он
+просто кладёт команду в `/usr/local/bin` (удобно на сервере, которым управляете удалённо, или чтобы
+прямо сейчас получить свежий CLI):
+
+```bash
+sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnawave.sh) @ install-script
+```
+
 > **GitHub заблокирован на сервере?** Каждый скрипт зеркалируется через jsDelivr — используйте вместо
 > `github.com/.../raw/main/` любой из адресов вида:
 > `https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main/<скрипт>.sh`
@@ -38,13 +53,18 @@ bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal
 
 ## 📦 Скрипты
 
-| Скрипт | Что делает | Документация |
-|---|---|---|
-| 🚀 **remnawave.sh** | Панель: установка, Caddy, бэкапы, subscription-page | этот файл |
-| 🛰 **remnanode.sh** | Нода: Xray-core, логи, автоперезапуск | этот файл |
-| 🎭 **selfsteal.sh** | Caddy-маскировка для Reality, 11 шаблонов сайтов | [README-selfsteal](./README-selfsteal.md) |
-| 🌐 **wtm.sh** | WARP + Tor: WireGuard-outbound для Xray, WARP+ | [README-warp](./README-warp.md) |
-| 🐦 **netbird.sh** | NetBird mesh-VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
+| Скрипт | Версия | Что делает | Документация |
+|---|---|---|---|
+| 🚀 **remnawave.sh** | `6.6.1` | Панель: установка, Caddy, бэкапы, subscription-page | этот файл |
+| 🛰 **remnanode.sh** | `4.5.1` | Нода: Xray-core, логи, автоперезапуск | этот файл |
+| 🎭 **selfsteal.sh** | `2.10.0` | Caddy-маскировка для Reality, 11 шаблонов сайтов | [README-selfsteal](./README-selfsteal.md) |
+| 🌐 **wtm.sh** | `1.5.2` | WARP + Tor: WireGuard-outbound для Xray, WARP+ | [README-warp](./README-warp.md) |
+| 🐦 **netbird.sh** | `1.4.2` | NetBird mesh-VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
+
+Каждый скрипт держит себя в актуальном состоянии: проверяет свою версию при `update` (и при
+открытии меню), ставит более новую **без вопросов** и повторяет вашу команду. Загрузка идёт сначала
+через GitHub, потом через зеркала jsDelivr. Чтобы поставить или обновить только CLI на сервере —
+команда `install-script`, см. таблицы команд ниже.
 
 ---
 

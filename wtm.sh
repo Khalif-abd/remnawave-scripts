@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WARP & Tor Network Setup Script
 # This script installs and manages Cloudflare WARP and Tor connections
-# VERSION=1.5.2
+# VERSION=1.6.0
 
 # NB: this is an interactive, status-returning menu script. We deliberately do
 # NOT use `set -e` (errexit): many functions return non-zero as a normal status
@@ -9,7 +9,7 @@
 # break the menu loop. We keep `set -E` (errtrace) so the ERR trap below can
 # surface genuinely unexpected failures for diagnostics without exiting.
 set -E
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.6.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Error handler for debugging (diagnostic only — never exits)
@@ -24,6 +24,9 @@ error_handler() {
     case $command in
         grep*|*\ grep\ *|*\|*grep*) return ;;
         check_*|verify_*|is_*|*systemctl\ is-*) return ;;
+        # A bare `return N` is a deliberate status hand-off, never a surprise
+        # failure — predicate helpers use it to say "no".
+        return|return\ *) return ;;
     esac
     echo -e "\033[1;31m[ERROR]\033[0m Command failed at line $line: $command (exit code: $exit_code)" >&2
 }
@@ -62,6 +65,17 @@ while [[ $# -gt 0 ]]; do
             WARP_LICENSE_KEY="${key#*=}"
             shift
         ;;
+        --dns-port)
+            # Tor DNSPort for install-tor. Same shift-then-read pattern as
+            # --license so a trailing flag cannot spin the loop forever.
+            shift
+            TOR_DNS_PORT="$1"
+            [ $# -gt 0 ] && shift
+        ;;
+        --dns-port=*)
+            TOR_DNS_PORT="${key#*=}"
+            shift
+        ;;
         -h|--help)
             COMMAND="help"
             shift
@@ -85,8 +99,29 @@ WARP_XRAY_FILE="/etc/wireguard/warp-xray-outbound.json"
 WARP_SOCKOPT_FILE="/etc/wireguard/warp-sockopt-outbound.json"
 TOR_CONFIG_FILE="/etc/tor/torrc"
 WARP_SERVICE="wg-quick@warp"
-TOR_SERVICE="tor"
+# NOTE: there is deliberately no TOR_SERVICE constant. On Debian/Ubuntu
+# `tor.service` is a Type=oneshot multi-instance master (ExecStart=/bin/true)
+# and the real daemon lives in tor@default.service — a hard-coded "tor" made
+# `enable --now` and `is-active` report success with no daemon running at
+# all. Always resolve the unit to act on with tor_unit().
 LOG_FILE="/var/log/wtm.log"
+
+# Tor runtime paths. The drop-in neutralises systemd's start-rate limiter:
+# without it, five fast crashes put the unit in `failed` PERMANENTLY and
+# systemd stops retrying — a service that silently stays dead for days.
+TOR_LOG_FILE="/var/log/tor/tor.log"
+TOR_DROPIN_NAME="99-wtm.conf"
+TOR_OVERRIDE_UNIT="/etc/systemd/system/tor.service"
+TOR_CIRCUIT_CACHE="/run/wtm-tor-circuit.cache"
+
+# Watchdog for Tor: same shape as the WARP one. Tor failing closed (listening
+# socket up, no circuits) or wedged in `failed` is exactly what a periodic
+# check catches and a status screen does not.
+TOR_WATCHDOG_SCRIPT="/opt/wtm/tor-watchdog.sh"
+TOR_WATCHDOG_CRON="/etc/cron.d/wtm-tor-watchdog"
+TOR_WATCHDOG_LOG="/var/log/wtm-tor-watchdog.log"
+TOR_WATCHDOG_STAMP="/run/wtm-tor-watchdog.stamp"
+TOR_WATCHDOG_FAILS="/run/wtm-tor-watchdog.fails"
 
 # Watchdog for the host wg-quick@warp interface (used by the freedom+sockopt
 # Xray variant and host tools): cron job that restarts the tunnel when the
@@ -173,21 +208,44 @@ check_port_available() {
     return 0  # Port is free
 }
 
-check_tor_ports() {
-    local socks_port=9050
-    local control_port=9051
-    local p
+# Is the listener on $1 tor itself? `ss -tlnp` prints users:(("tor",pid=...)),
+# `netstat -tlnp` prints "<pid>/tor". Without this a --force reinstall aborts
+# with "port not available" because the port is held by the very Tor we are
+# about to reconfigure.
+port_listener_is_tor() {
+    local out
+    out=$(port_listeners "$1") || out=""
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out" | grep -qE '\("tor"|[0-9]+/tor([[:space:]]|$)'
+}
 
-    for p in "$socks_port" "$control_port"; do
-        if ! check_port_available "$p"; then
-            warn "Port $p is already in use"
-            echo -e "\033[38;5;244m   Process using port $p:\033[0m"
-            port_listeners "$p" | sed 's/^/   /'
-            return 1
+# $@ = ports to check. With no arguments, checks the ports wtm is about to
+# WRITE (9050/9051 + any DNSPort), not whatever a stale torrc happens to say —
+# otherwise a reinstall could validate the old ports and then bind new ones.
+check_tor_ports() {
+    local p busy=0 ports
+    if [ $# -gt 0 ]; then
+        ports="$*"
+    else
+        ports="9050 9051 $(tor_dns_port)"
+    fi
+
+    for p in $ports; do
+        [ "$p" = "0" ] && continue
+        check_port_available "$p" && continue
+
+        if port_listener_is_tor "$p"; then
+            info "Port $p is held by the running Tor instance — will be reused"
+            continue
         fi
+
+        warn "Port $p is already in use by another process"
+        echo -e "\033[38;5;244m   Process using port $p:\033[0m"
+        port_listeners "$p" | sed 's/^/   /'
+        busy=1
     done
 
-    return 0
+    return $busy
 }
 
 # Функция для проверки доступности порта (для отображения в меню)
@@ -282,6 +340,7 @@ Installation:
     install-warp          Install Cloudflare WARP
     install-warp --license <KEY>   Install WARP and upgrade to WARP+
     install-tor           Install Tor anonymity network
+    install-tor --dns-port <N>     Install Tor with a DNSPort on 127.0.0.1:N
     install-all           Install both WARP and Tor
     install-warp-force    Force reinstall WARP
     install-tor-force     Force reinstall Tor
@@ -296,6 +355,10 @@ Service Control:
     start-tor             Start Tor service
     stop-tor              Stop Tor service
     restart-tor           Restart Tor service
+    repair-tor            Fix a broken Tor unit (masked/failed/shadowed) and restart
+    tor-watchdog-on       Enable the Tor watchdog (cron)
+    tor-watchdog-off      Disable the Tor watchdog
+    new-identity          Request fresh Tor circuits (control-port NEWNYM)
 
 Monitoring:
     status                Show services status
@@ -325,6 +388,7 @@ Script Management:
 Options:
     --force, -f           Force operation
     --license <KEY>       WARP+ license key (with install-warp)
+    --dns-port <N>        Tor DNSPort (with install-tor); inherited on reinstall
     --help, -h            Show this help
     --version, -v         Show version
 
@@ -333,6 +397,8 @@ Examples:
     $(basename "$0") @ install-warp --force
     $(basename "$0") install-warp --license 1a2b3c4d-5e6f7g8h-9i0j1k2l
     $(basename "$0") warp-plus 1a2b3c4d-5e6f7g8h-9i0j1k2l
+    $(basename "$0") install-tor --dns-port 5353
+    $(basename "$0") repair-tor
     $(basename "$0") status
     $(basename "$0") test
 
@@ -354,21 +420,53 @@ show_version() {
     echo -e "\033[38;5;8m$(printf '─%.0s' $(seq 1 40))\033[0m"
 }
 
+# Compare dotted numeric versions: 0 when $1 is strictly newer than $2.
+# A plain string `!=` was used before, which treats "older" as "an update is
+# available" — so a working copy ahead of the published one is told to
+# downgrade, and self-update happily does it.
+version_gt() {
+    local a="$1" b="$2" i ai bi
+    local -a va vb
+    # Keep only the numeric core: 1.6.0-rc1 -> 1.6.0
+    a="${a%%[!0-9.]*}"
+    b="${b%%[!0-9.]*}"
+    IFS='.' read -r -a va <<< "$a"
+    IFS='.' read -r -a vb <<< "$b"
+    for i in 0 1 2 3; do
+        ai="${va[i]:-0}"
+        bi="${vb[i]:-0}"
+        case "$ai" in ''|*[!0-9]*) ai=0 ;; esac
+        case "$bi" in ''|*[!0-9]*) bi=0 ;; esac
+        [ "$ai" -gt "$bi" ] && return 0
+        [ "$ai" -lt "$bi" ] && return 1
+    done
+    return 1
+}
+
+# Fetch the published version marker. Empty on any failure.
+remote_wtm_version() {
+    curl -fsSL "$SCRIPT_URL" 2>/dev/null | grep -m1 "^# VERSION=" | cut -d'=' -f2
+}
+
 check_for_updates() {
     info "Checking for updates..."
     # Use comment VERSION for grep-based detection (per project standard)
     local remote_script_version
-    remote_script_version=$(curl -fsSL "$SCRIPT_URL" 2>/dev/null | grep -m1 "^# VERSION=" | cut -d'=' -f2)
+    remote_script_version=$(remote_wtm_version)
 
     if [[ -z "$remote_script_version" ]]; then
         warn "Unable to check for updates (no internet connection or invalid URL)"
         return 1
     fi
-    
-    if [ "$remote_script_version" != "$SCRIPT_VERSION" ]; then
+
+    if version_gt "$remote_script_version" "$SCRIPT_VERSION"; then
         echo -e "\033[1;33m🆙 New version available: $remote_script_version (current: $SCRIPT_VERSION)\033[0m"
         echo -e "   Update with: \033[1;37mwtm self-update\033[0m"
         return 0
+    elif version_gt "$SCRIPT_VERSION" "$remote_script_version"; then
+        # Running a working copy that has not been published yet.
+        info "This build ($SCRIPT_VERSION) is ahead of the published $remote_script_version — nothing to update"
+        return 1
     else
         ok "You are using the latest version ($SCRIPT_VERSION)"
         return 1
@@ -431,6 +529,26 @@ update_wtm_script() {
     return 1
 }
 
+# Install `wtm` globally, preferring THIS file when it is newer than what is
+# published. Running a local working copy used to fetch and install the older
+# published script, silently downgrading the very tool just invoked.
+install_wtm_best_available() {
+    local script_path remote
+    script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+    remote=$(remote_wtm_version)
+
+    if [ -n "$script_path" ] && [ -f "$script_path" ] && [ -n "$remote" ] && \
+       version_gt "$SCRIPT_VERSION" "$remote"; then
+        info "This file (v$SCRIPT_VERSION) is newer than the published v$remote — installing it as-is"
+        if install -m 755 "$script_path" /usr/local/bin/wtm 2>/dev/null; then
+            return 0
+        fi
+        warn "Could not install the local file — falling back to the published version"
+    fi
+
+    download_and_install_wtm
+}
+
 self_update() {
     if [[ "$(id -u)" != "0" ]]; then
         error "This operation requires root privileges"
@@ -439,7 +557,7 @@ self_update() {
     fi
 
     local remote_script_version
-    remote_script_version=$(curl -fsSL "$SCRIPT_URL" 2>/dev/null | grep -m1 "^# VERSION=" | cut -d'=' -f2)
+    remote_script_version=$(remote_wtm_version)
 
     if [ -z "$remote_script_version" ]; then
         error_exit "Unable to download update (no internet connection)"
@@ -450,7 +568,19 @@ self_update() {
         return 0
     fi
 
-    info "Updating from version $SCRIPT_VERSION to $remote_script_version..."
+    # Never silently downgrade. Hitting `self-update` on a build that is ahead
+    # of the repository used to overwrite it with the older published file.
+    if ! version_gt "$remote_script_version" "$SCRIPT_VERSION"; then
+        warn "The published version ($remote_script_version) is OLDER than this one ($SCRIPT_VERSION)"
+        if [ "${FORCE_INSTALL:-false}" != "true" ]; then
+            echo -e "\033[38;5;244m   Nothing to do. To install the older published version anyway:\033[0m"
+            echo -e "\033[38;5;244m   $(basename "$0") self-update --force\033[0m"
+            return 1
+        fi
+        warn "Downgrading to $remote_script_version because --force was given"
+    else
+        info "Updating from version $SCRIPT_VERSION to $remote_script_version..."
+    fi
 
     if update_wtm_script; then
         ok "Successfully updated to version $remote_script_version"
@@ -1207,32 +1337,382 @@ uninstall_warp() {
 
 # ===== TOR FUNCTIONS =====
 
+# ── Which unit actually runs the daemon? ──────────────────────────────────
+# Debian/Ubuntu ship tor.service as a Type=oneshot / ExecStart=/bin/true
+# multi-instance master; the daemon is tor@default.service. Acting on
+# tor.service there is worse than useless: `enable --now` succeeds and
+# `is-active` reports "active" while no tor process exists at all.
+# RHEL-family ships a normal tor.service, so resolve at runtime.
+tor_unit() {
+    if [ -n "${TOR_UNIT_CACHE:-}" ]; then
+        echo "$TOR_UNIT_CACHE"
+        return 0
+    fi
+    local unit="tor"
+    if [ "$(systemctl show -p Type --value tor.service 2>/dev/null)" = "oneshot" ] && \
+       systemctl cat tor@default.service >/dev/null 2>&1; then
+        unit="tor@default"
+    fi
+    TOR_UNIT_CACHE="$unit"
+    echo "$unit"
+}
+
+# Installing/removing the package changes the answer above.
+tor_unit_reset() {
+    TOR_UNIT_CACHE=""
+}
+
+# Every unit name Tor may be reachable under. Used for the blanket
+# unmask / reset-failed / disable sweeps.
+tor_all_units() {
+    echo "tor.service tor@default.service"
+}
+
+# ── Ports actually in effect ──────────────────────────────────────────────
+# Read from torrc so status, tests and port checks stay honest after the
+# user edits the config by hand (menu option 9 hands them an editor).
+tor_conf_port() {
+    local directive="$1" fallback="$2" p
+    p=$(awk -v d="$directive" \
+        'tolower($1)==tolower(d) && NF>1 {print $2; exit}' \
+        "$TOR_CONFIG_FILE" 2>/dev/null) || p=""
+    p="${p##*:}"
+    case "$p" in
+        ''|*[!0-9]*) echo "$fallback" ;;
+        *)           echo "$p" ;;
+    esac
+}
+
+tor_socks_port()   { tor_conf_port SocksPort   9050; }
+tor_control_port() { tor_conf_port ControlPort 9051; }
+
+# DNSPort is optional — 0 means "not configured". A --dns-port flag wins over
+# whatever is on disk; otherwise the existing value is inherited so a
+# `--force` reinstall cannot silently break an Xray DNS pointed at it.
+tor_dns_port() {
+    if [ -n "${TOR_DNS_PORT:-}" ]; then
+        case "$TOR_DNS_PORT" in
+            ''|*[!0-9]*) echo 0 ;;
+            *)           echo "$TOR_DNS_PORT" ;;
+        esac
+        return 0
+    fi
+    tor_conf_port DNSPort 0
+}
+
+# ── Hand-written unit detection ───────────────────────────────────────────
+# Returns the path of an operator-written /etc/systemd/system/tor.service
+# that shadows the packaged unit, or nothing. Quiet — for status paths.
+tor_override_path() {
+    local frag
+    frag=$(systemctl show -p FragmentPath --value tor.service 2>/dev/null) || frag=""
+    if [ "$frag" = "$TOR_OVERRIDE_UNIT" ]; then
+        echo "$frag"
+    elif [ -z "$frag" ] && [ -f "$TOR_OVERRIDE_UNIT" ]; then
+        echo "$TOR_OVERRIDE_UNIT"
+    fi
+}
+
+# The specific booby-trap: ExecStartPre= runs as User= unless prefixed with
+# '+' (or paired with the deprecated PermissionsStartOnly=yes). A unit copied
+# from the packaged tor@default.service WITHOUT that line has an
+# ExecStartPre that tries to mkdir /run/tor as debian-tor — which cannot
+# write to root-owned /run. Tor then never starts, and with Restart=always
+# it burns through StartLimitBurst and stays `failed` forever.
+tor_override_is_broken() {
+    local frag="$1"
+    [ -n "$frag" ] && [ -f "$frag" ] || return 1
+    grep -qE '^[[:space:]]*User=' "$frag" || return 1
+    grep -qE '^[[:space:]]*ExecStartPre=[^+!-]' "$frag" || return 1
+    grep -qE '^[[:space:]]*PermissionsStartOnly=[[:space:]]*(yes|true|1)' "$frag" && return 1
+    return 0
+}
+
+# Noisy variant used by install/repair. 0 = nothing shadowing the package.
+check_tor_unit_sanity() {
+    local frag
+    frag=$(tor_override_path)
+    [ -n "$frag" ] || return 0
+
+    warn "tor.service is shadowed by a hand-written unit: $frag"
+    if tor_override_is_broken "$frag"; then
+        error "That unit runs ExecStartPre= as \$User= — it cannot create /run/tor and Tor will never start"
+        echo -e "\033[38;5;244m   Fix: prefix ExecStartPre with '+', or drop it and use RuntimeDirectory=tor\033[0m"
+    fi
+    if grep -qE '^[[:space:]]*Restart=always' "$frag" && \
+       ! grep -qE '^[[:space:]]*StartLimit(IntervalSec|Burst)=' "$frag"; then
+        warn "It also uses Restart=always without a StartLimit override — repeated crashes wedge it in 'failed' permanently"
+    fi
+    return 1
+}
+
+# Move a broken hand-written unit out of the way (never delete outright — the
+# operator may want it back). Only touches units we positively identify as
+# broken, unless $1 = force.
+remove_broken_tor_override() {
+    local mode="${1:-auto}" frag backup
+    frag=$(tor_override_path)
+    [ -n "$frag" ] || return 0
+
+    if [ "$mode" != "force" ] && ! tor_override_is_broken "$frag"; then
+        warn "Leaving the custom $frag in place (it does not look broken)"
+        echo -e "\033[38;5;244m   Force its removal with: $(basename "$0") install-tor-force\033[0m"
+        return 0
+    fi
+
+    backup="${frag}.wtm-backup.$(date +%s)"
+    if mv "$frag" "$backup" 2>/dev/null; then
+        ok "Custom unit moved aside: $backup"
+        info "The packaged Tor unit is now in charge again"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        tor_unit_reset
+    else
+        error "Failed to move $frag out of the way"
+        return 1
+    fi
+}
+
+# ── Bring the unit into a startable state ─────────────────────────────────
+# A masked unit swallows `enable --now` without an error, and a unit already
+# in `failed` from a previous start-limit trip refuses to start until it is
+# reset. Neither was handled before.
+tor_prepare_unit() {
+    local u
+    for u in $(tor_all_units); do
+        if [ "$(systemctl is-enabled "$u" 2>/dev/null)" = "masked" ]; then
+            info "Unmasking $u"
+        fi
+        systemctl unmask "$u" >/dev/null 2>&1 || true
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1
+    tor_unit_reset
+}
+
+ensure_tor_runtime_dirs() {
+    mkdir -p /etc/tor /var/log/tor
+    chown debian-tor:debian-tor /var/log/tor 2>/dev/null || \
+        chown tor:tor /var/log/tor 2>/dev/null || true
+    chmod 2750 /var/log/tor 2>/dev/null || true
+    if [ -f "$TOR_LOG_FILE" ]; then
+        chown debian-tor:debian-tor "$TOR_LOG_FILE" 2>/dev/null || \
+            chown tor:tor "$TOR_LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+# Drop-in that keeps a crash loop from becoming a permanent outage.
+install_tor_dropin() {
+    local unit dir
+    unit=$(tor_unit)
+    dir="/etc/systemd/system/${unit}.service.d"
+    mkdir -p "$dir"
+    cat > "${dir}/${TOR_DROPIN_NAME}" <<'EOF'
+# Managed by wtm — do not edit; regenerated on install/repair.
+[Unit]
+# systemd's default StartLimitBurst=5 / 10s turns five fast crashes into a
+# permanent `failed` state that is never retried. Tor restarts are cheap;
+# a service silently dead for days is not.
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=10s
+EOF
+    chmod 644 "${dir}/${TOR_DROPIN_NAME}"
+    systemctl daemon-reload >/dev/null 2>&1
+}
+
+remove_tor_dropin() {
+    local u dir
+    for u in tor tor@default; do
+        dir="/etc/systemd/system/${u}.service.d"
+        rm -f "${dir}/${TOR_DROPIN_NAME}"
+        rmdir "$dir" 2>/dev/null || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1
+}
+
+# ── Waiting for a usable Tor, not just an open socket ─────────────────────
+# The SOCKS listener opens almost immediately; building circuits takes
+# anywhere from a few seconds to well over half a minute. The old `sleep 5`
+# reported success on a Tor that had not bootstrapped at all.
+tor_bootstrap_line() {
+    local unit since
+    unit=$(tor_unit)
+    since=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null)
+    if [ -n "$since" ] && [ "$since" != "n/a" ]; then
+        journalctl -u "$unit" --since "$since" --no-pager 2>/dev/null | \
+            grep -o 'Bootstrapped [0-9]\+%.*' | tail -1
+    fi
+}
+
+# 0 = this run of the daemon reached 100%. Deliberately requires the unit to
+# be active AND the socket to be up, so a stale "Bootstrapped 100%" left in
+# the log by a previous run cannot fake success.
+tor_bootstrapped() {
+    local unit since since_epoch log_mtime
+    unit=$(tor_unit)
+    systemctl is-active --quiet "$unit" 2>/dev/null || return 1
+    check_port_listening "$(tor_socks_port)" || return 1
+
+    since=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null)
+    if [ -n "$since" ] && [ "$since" != "n/a" ]; then
+        journalctl -u "$unit" --since "$since" --no-pager 2>/dev/null | \
+            grep -q 'Bootstrapped 100%' && return 0
+    fi
+
+    # torrc may send notices only to a file. Trust it only if the file was
+    # written after this run started.
+    [ -f "$TOR_LOG_FILE" ] || return 1
+    since_epoch=$(date -d "$since" +%s 2>/dev/null) || since_epoch=""
+    log_mtime=$(stat -c %Y "$TOR_LOG_FILE" 2>/dev/null)
+    if [ -n "$since_epoch" ] && [ -n "$log_mtime" ] && [ "$log_mtime" -lt "$since_epoch" ]; then
+        return 1
+    fi
+    tail -n 200 "$TOR_LOG_FILE" 2>/dev/null | grep -q 'Bootstrapped 100%'
+}
+
+wait_for_tor() {
+    local timeout="${1:-90}" unit deadline last_report progress
+    unit=$(tor_unit)
+    deadline=$(( $(date +%s) + timeout ))
+    last_report=$(date +%s)
+
+    info "Waiting for Tor to bootstrap (up to ${timeout}s)..."
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if systemctl is-failed --quiet "$unit" 2>/dev/null; then
+            error "$unit entered the failed state while starting"
+            echo -e "\033[38;5;244m   Check: journalctl -u $unit -n 30 --no-pager\033[0m"
+            return 1
+        fi
+        if tor_bootstrapped; then
+            ok "Tor bootstrapped 100%"
+            return 0
+        fi
+        # Progress every ~10s so a 30-40s bootstrap does not look like a hang
+        if [ $(( $(date +%s) - last_report )) -ge 10 ]; then
+            last_report=$(date +%s)
+            progress=$(tor_bootstrap_line)
+            [ -n "$progress" ] && echo -e "\033[38;5;244m   $progress\033[0m"
+        fi
+        sleep 2
+    done
+
+    warn "Tor did not report a completed bootstrap within ${timeout}s"
+    echo -e "\033[38;5;244m   Check: journalctl -u $unit -n 30 --no-pager  •  tail $TOR_LOG_FILE\033[0m"
+    return 1
+}
+
+# ── Repair ────────────────────────────────────────────────────────────────
+# Everything short of reinstalling: clear the shadowing unit, unmask, reset
+# the failed state, fix directory ownership, install the drop-in, restart,
+# and confirm with a real circuit rather than an open port.
+repair_tor() {
+    step "Repairing the existing Tor installation..."
+
+    if ! command -v tor >/dev/null 2>&1; then
+        warn "The tor binary is missing — a repair is not possible"
+        return 1
+    fi
+
+    tor_unit_reset
+    check_tor_unit_sanity
+    remove_broken_tor_override
+
+    tor_prepare_unit
+    ensure_tor_runtime_dirs
+    install_tor_dropin
+
+    local unit
+    unit=$(tor_unit)
+    info "Controlling unit: $unit"
+
+    systemctl enable "$unit" >/dev/null 2>&1
+    if ! systemctl restart "$unit" >/dev/null 2>&1; then
+        error "Failed to start $unit"
+        echo -e "\033[38;5;244m   Check: journalctl -u $unit -n 30 --no-pager\033[0m"
+        return 1
+    fi
+
+    if ! wait_for_tor 90; then
+        return 1
+    fi
+
+    if verify_tor_circuit; then
+        ok "Tor repaired — circuit verified through the SOCKS proxy"
+    else
+        warn "Tor is running and bootstrapped, but a test request through it failed"
+        echo -e "\033[38;5;244m   Retry: $(basename "$0") test\033[0m"
+    fi
+    return 0
+}
+
 install_tor() {
     step "Installing Tor..."
     
-    # Проверяем, установлен ли уже Tor (если не принудительная установка)
+    # A config file on disk is NOT evidence that Tor works. The old check
+    # returned "already installed and configured" for a torrc sitting next to
+    # a unit that had been dead for days. Gate on observed state instead, and
+    # repair rather than refuse.
     if [ "${FORCE_INSTALL:-false}" != "true" ] && [ -f "$TOR_CONFIG_FILE" ]; then
-        warn "Tor is already installed and configured at $TOR_CONFIG_FILE"
-        echo "Use '--force' flag to reinstall: bash $0 install-tor-force"
+        local existing_status
+        existing_status=$(check_tor_status)
+        case "$existing_status" in
+            running)
+                warn "Tor is already installed and running"
+                echo "Use '--force' flag to reinstall: bash $0 install-tor-force"
+                return 1
+                ;;
+            *)
+                warn "Tor config exists at $TOR_CONFIG_FILE but the service is NOT healthy (state: $existing_status)"
+                if repair_tor; then
+                    install_tor_offer_watchdog
+                    return 0
+                fi
+                warn "Repair did not bring Tor up — falling through to a full reinstall"
+                FORCE_INSTALL=true
+                ;;
+        esac
+    fi
+
+    # Inherit a DNSPort that is already configured unless --dns-port overrides
+    # it, so a reinstall cannot silently break an Xray DNS pointed at it.
+    if [ -z "${TOR_DNS_PORT:-}" ] && [ -f "$TOR_CONFIG_FILE" ]; then
+        local inherited_dns
+        inherited_dns=$(tor_conf_port DNSPort 0)
+        if [ "$inherited_dns" != "0" ]; then
+            TOR_DNS_PORT="$inherited_dns"
+            info "Preserving the existing DNSPort $inherited_dns (override with --dns-port)"
+        fi
+    fi
+
+    # Check if ports are available. NOT error_exit: that calls exit and would
+    # kill the whole interactive menu on a busy port.
+    if ! check_tor_ports; then
+        error "Required Tor ports are not available"
         return 1
     fi
-    
-    # Check if ports are available
-    if ! check_tor_ports; then
-        error_exit "Required ports (9050, 9051) are not available"
-    fi
-    
+
     install_package tor
+    # The package decides which unit actually runs the daemon — re-resolve.
+    tor_unit_reset
 
     # Configure Tor
     info "Configuring Tor..."
 
-    # Backup original config
-    if [ -f "$TOR_CONFIG_FILE" ] && [ ! -f "$TOR_CONFIG_FILE.backup" ]; then
-        cp "$TOR_CONFIG_FILE" "$TOR_CONFIG_FILE.backup"
+    # Back up EVERY time, timestamped. The old "only if .backup is missing"
+    # rule meant the second reinstall silently ate the user's edits.
+    if [ -f "$TOR_CONFIG_FILE" ]; then
+        local torrc_backup="$TOR_CONFIG_FILE.backup.$(date +%Y%m%d-%H%M%S)"
+        if cp "$TOR_CONFIG_FILE" "$torrc_backup" 2>/dev/null; then
+            info "Previous config backed up to $torrc_backup"
+        fi
+        # Keep the 5 most recent backups; older ones are noise.
+        ls -1t "$TOR_CONFIG_FILE".backup.* 2>/dev/null | tail -n +6 | \
+            while read -r old; do rm -f "$old"; done
     fi
 
-    mkdir -p /etc/tor
+    ensure_tor_runtime_dirs
 
     # Optional control-port password (hashed). CookieAuthentication is always on,
     # so the control port is protected even without a password. We only add a
@@ -1254,6 +1734,21 @@ install_tor() {
     # Create Tor configuration. Ports are bound explicitly to 127.0.0.1 so the
     # SOCKS proxy and (especially) the control port are never exposed to the
     # network by an accidental default change.
+    # Optional DNSPort. AutomapHostsOnResolve is what makes .onion resolvable
+    # through it, which is the whole point of pointing Xray's DNS here.
+    local TOR_DNS_BLOCK="" dns_port
+    dns_port=$(tor_dns_port)
+    if [ "$dns_port" != "0" ]; then
+        TOR_DNS_BLOCK=$(cat <<EOF
+
+# DNS over Tor (wtm --dns-port)
+DNSPort 127.0.0.1:$dns_port
+AutomapHostsOnResolve 1
+AutomapHostsSuffixes .onion,.exit
+EOF
+)
+    fi
+
     cat > "$TOR_CONFIG_FILE" <<EOF
 # Tor configuration for local proxy mode (managed by wtm)
 SocksPort 127.0.0.1:9050
@@ -1261,7 +1756,11 @@ ControlPort 127.0.0.1:9051
 ${TOR_HASHED_PASSWORD:+HashedControlPassword $TOR_HASHED_PASSWORD}
 CookieAuthentication 1
 DataDirectory /var/lib/tor
-Log notice file /var/log/tor/tor.log
+# Log to BOTH: the file keeps history across restarts, stdout puts the same
+# notices in the journal so \`wtm logs tor\` and bootstrap detection work.
+Log notice file $TOR_LOG_FILE
+Log notice stdout
+$TOR_DNS_BLOCK
 
 # Only accept SOCKS requests from localhost
 SocksPolicy accept 127.0.0.1
@@ -1281,43 +1780,351 @@ EOF
     chown debian-tor:debian-tor "$TOR_CONFIG_FILE" 2>/dev/null || chown tor:tor "$TOR_CONFIG_FILE" 2>/dev/null
     chmod 644 "$TOR_CONFIG_FILE"
 
-    # Create log directory
-    mkdir -p /var/log/tor
-    chown debian-tor:debian-tor /var/log/tor 2>/dev/null || chown tor:tor /var/log/tor 2>/dev/null
+    ensure_tor_runtime_dirs
 
-    # Enable and start Tor
-    if systemctl enable --now "$TOR_SERVICE" >/dev/null 2>&1; then
-        systemctl restart "$TOR_SERVICE" >/dev/null 2>&1
-    else
-        warn "Tor service failed to enable/start — check: journalctl -u $TOR_SERVICE"
+    # Reject a bad config before restarting into a crash loop.
+    if command -v tor >/dev/null 2>&1; then
+        if ! tor --verify-config -f "$TOR_CONFIG_FILE" >/dev/null 2>&1; then
+            error "Generated torrc failed Tor's own validation"
+            tor --verify-config -f "$TOR_CONFIG_FILE" 2>&1 | tail -5 | sed 's/^/   /'
+            return 1
+        fi
     fi
 
-    # Wait for Tor to start
-    sleep 5
+    # Clear anything that would make the start silently do nothing: a
+    # shadowing hand-written unit, a mask, or a leftover `failed` state.
+    check_tor_unit_sanity
+    remove_broken_tor_override "$([ "${FORCE_INSTALL:-false}" = "true" ] && echo force || echo auto)"
+    tor_prepare_unit
+    install_tor_dropin
 
-    if verify_tor_connection; then
-        ok "Tor installation completed successfully"
+    local unit
+    unit=$(tor_unit)
+    info "Controlling unit: $unit"
+
+    if ! systemctl enable "$unit" >/dev/null 2>&1; then
+        warn "Could not enable $unit for boot — check: systemctl status $unit"
+    fi
+    if ! systemctl restart "$unit" >/dev/null 2>&1; then
+        error "Tor service failed to start — check: journalctl -u $unit -n 30 --no-pager"
+        return 1
+    fi
+
+    # Bootstrap takes anywhere from seconds to well over a minute; the old
+    # fixed `sleep 5` then checked only that a socket was open.
+    if wait_for_tor 120; then
+        if verify_tor_circuit; then
+            ok "Tor installation completed — circuit verified through the SOCKS proxy"
+        else
+            warn "Tor bootstrapped, but a test request through the SOCKS proxy failed"
+            echo -e "\033[38;5;244m   Retry: $(basename "$0") test\033[0m"
+        fi
     else
-        warn "Tor installed but connection verification failed"
+        warn "Tor installed, but it did not confirm a completed bootstrap"
+    fi
+
+    echo -e "\033[38;5;250m   SOCKS5: 127.0.0.1:9050   Control: 127.0.0.1:9051\033[0m"
+    [ "$dns_port" != "0" ] && echo -e "\033[38;5;250m   DNS:    127.0.0.1:$dns_port\033[0m"
+
+    install_tor_offer_watchdog
+}
+
+# Enable the watchdog on a fresh install unless it is already there. Silent
+# when running non-interactively so `install-tor` stays scriptable.
+install_tor_offer_watchdog() {
+    tor_watchdog_enabled && return 0
+    if [ "${WTM_NO_WATCHDOG:-false}" = "true" ]; then
+        return 0
+    fi
+    info "Enabling the Tor watchdog (cron */5) so a dead service cannot go unnoticed"
+    echo -e "\033[38;5;244m   Disable any time with: $(basename "$0") tor-watchdog-off\033[0m"
+    install_tor_watchdog
+}
+
+# Level 1: is the SOCKS listener up? Cheap, but says nothing about whether
+# traffic actually gets anywhere.
+verify_tor_connection() {
+    check_port_listening "$(tor_socks_port)"
+}
+
+# Level 2: does a request actually traverse the Tor network? A Tor that
+# listens but never bootstrapped (blocked DC, no route to the directory
+# authorities) passes level 1 and fails everything real — the status screen
+# used to show it as a healthy RUNNING / SOCKS5 ✅.
+# --socks5-hostname, NOT --socks5: the latter resolves DNS locally, which
+# both leaks the lookup around Tor and fails outright on hosts with a broken
+# resolv.conf. /api/ip is a tiny JSON document instead of a full HTML page.
+verify_tor_circuit() {
+    local port
+    port="${1:-$(tor_socks_port)}"
+    [ "$port" = "0" ] && return 1
+    curl -s --max-time 20 --socks5-hostname "127.0.0.1:$port" \
+        https://check.torproject.org/api/ip 2>/dev/null | \
+        grep -qE '"IsTor"[[:space:]]*:[[:space:]]*true'
+}
+
+# Menu-safe circuit state. Never blocks the render: returns the cached
+# verdict and refreshes in the background when it goes stale. A synchronous
+# 20s probe on every menu redraw would be unusable.
+# Prints: ok | fail | unknown
+tor_circuit_state() {
+    local ttl=60 stale=600 lock_ttl=120 now ts val lock_age
+    now=$(date +%s)
+    ts=0
+    val="unknown"
+
+    if [ -f "$TOR_CIRCUIT_CACHE" ]; then
+        read -r ts val < "$TOR_CIRCUIT_CACHE" 2>/dev/null || true
+        case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+        case "$val" in ok|fail) : ;; *) val="unknown" ;; esac
+    fi
+
+    # A probe killed mid-flight would otherwise leave the lock behind and
+    # freeze the reading at "unknown" forever.
+    if [ -f "$TOR_CIRCUIT_CACHE.lock" ]; then
+        lock_age=$(stat -c %Y "$TOR_CIRCUIT_CACHE.lock" 2>/dev/null) || lock_age=""
+        case "$lock_age" in
+            ''|*[!0-9]*) rm -f "$TOR_CIRCUIT_CACHE.lock" ;;
+            *) [ $((now - lock_age)) -ge "$lock_ttl" ] && rm -f "$TOR_CIRCUIT_CACHE.lock" ;;
+        esac
+    fi
+
+    if [ $((now - ts)) -ge "$ttl" ] && [ ! -f "$TOR_CIRCUIT_CACHE.lock" ]; then
+        (
+            : > "$TOR_CIRCUIT_CACHE.lock"
+            if verify_tor_circuit; then
+                echo "$(date +%s) ok" > "$TOR_CIRCUIT_CACHE.tmp"
+            else
+                echo "$(date +%s) fail" > "$TOR_CIRCUIT_CACHE.tmp"
+            fi
+            mv -f "$TOR_CIRCUIT_CACHE.tmp" "$TOR_CIRCUIT_CACHE"
+            rm -f "$TOR_CIRCUIT_CACHE.lock"
+        ) >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+
+    # A very old verdict is worse than no verdict.
+    [ $((now - ts)) -ge "$stale" ] && val="unknown"
+    echo "$val"
+}
+
+# ── New identity ──────────────────────────────────────────────────────────
+# `systemctl reload tor` sends SIGHUP, which re-reads torrc — it does NOT
+# rotate circuits, so the old menu entry claimed an identity change that
+# never happened. A real NEWNYM goes through the control port.
+tor_new_identity() {
+    local port auth pass cookie hex response
+    port=$(tor_control_port)
+
+    if ! check_port_listening "$port"; then
+        error "Tor control port $port is not accessible"
+        return 1
+    fi
+
+    if [ -r /etc/tor/.control_password ]; then
+        pass=$(cat /etc/tor/.control_password 2>/dev/null)
+        auth="AUTHENTICATE \"$pass\""
+    else
+        cookie=$(ls /run/tor/control.authcookie \
+                    /var/run/tor/control.authcookie \
+                    /var/lib/tor/control_auth_cookie 2>/dev/null | head -1)
+        if [ -n "$cookie" ] && [ -r "$cookie" ]; then
+            hex=$(od -An -tx1 -v "$cookie" 2>/dev/null | tr -d ' \n')
+            auth="AUTHENTICATE $hex"
+        else
+            auth="AUTHENTICATE"
+        fi
+    fi
+
+    if ! exec 3<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+        warn "Could not open the control port — falling back to a config reload (this does NOT rotate circuits)"
+        systemctl reload "$(tor_unit)" >/dev/null 2>&1
+        return 1
+    fi
+
+    printf '%s\r\nSIGNAL NEWNYM\r\nQUIT\r\n' "$auth" >&3
+    response=$(timeout 10 cat <&3 2>/dev/null) || response=""
+    exec 3<&- 2>/dev/null
+    exec 3>&- 2>/dev/null
+
+    # Tor answers "250 OK" per command; an auth failure is 515.
+    if printf '%s' "$response" | grep -q '^515'; then
+        error "Control port rejected authentication"
+        echo -e "\033[38;5;244m   Reinstall to regenerate credentials: $(basename "$0") install-tor-force\033[0m"
+        return 1
+    fi
+    if [ "$(printf '%s' "$response" | grep -c '^250')" -lt 2 ]; then
+        error "Tor did not confirm the NEWNYM signal"
+        printf '%s\n' "$response" | sed 's/^/   /'
+        return 1
+    fi
+
+    # Circuits changed — the cached verdict is about the old ones.
+    rm -f "$TOR_CIRCUIT_CACHE" 2>/dev/null
+    ok "New Tor identity requested (NEWNYM) — fresh circuits will be used"
+    return 0
+}
+
+# ── Tor watchdog ──────────────────────────────────────────────────────────
+# WARP had one; Tor did not — yet "the unit died and stayed dead" is exactly
+# the failure a periodic check exists to catch. Restarts on a dead unit or a
+# closed SOCKS port immediately, and on repeated circuit failures only after
+# two consecutive misses so a transient network blip is not a restart trigger.
+install_tor_watchdog() {
+    local unit socks
+    unit=$(tor_unit)
+    socks=$(tor_socks_port)
+
+    mkdir -p "$(dirname "$TOR_WATCHDOG_SCRIPT")"
+    # Header: UNQUOTED heredoc so wtm's constants interpolate (one source of
+    # truth). Body below is a QUOTED heredoc — its $vars stay literal.
+    cat > "$TOR_WATCHDOG_SCRIPT" <<EOF
+#!/usr/bin/env bash
+# wtm Tor watchdog — restarts $unit when Tor stops actually working.
+SERVICE="$unit"
+SOCKS_PORT="$socks"
+RESTART_COOLDOWN=300      # min seconds between restarts
+CIRCUIT_STRIKES=2         # consecutive circuit failures before restarting
+STAMP="$TOR_WATCHDOG_STAMP"
+FAILS="$TOR_WATCHDOG_FAILS"
+LOG="$TOR_WATCHDOG_LOG"
+MAX_LOG_LINES=1000
+EOF
+    cat >> "$TOR_WATCHDOG_SCRIPT" <<'EOF'
+
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt "$MAX_LOG_LINES" ]; then
+    tail -n "$MAX_LOG_LINES" "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$LOG"
+}
+
+read_fails() {
+    local n
+    n=$(cat "$FAILS" 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    echo "$n"
+}
+
+now=$(date +%s)
+reason=""
+
+if ! systemctl is-active --quiet "$SERVICE"; then
+    reason="service inactive"
+elif ! ss -tln 2>/dev/null | grep -q "127.0.0.1:$SOCKS_PORT "; then
+    reason="SOCKS port $SOCKS_PORT not listening"
+else
+    # Listening but possibly not bootstrapped. Require consecutive failures
+    # so one flaky probe cannot bounce a healthy Tor.
+    if curl -s --max-time 25 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+            https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+        [ "$(read_fails)" != "0" ] && log "RECOVERED — circuit works again"
+        echo 0 > "$FAILS"
+        exit 0
+    fi
+    strikes=$(( $(read_fails) + 1 ))
+    echo "$strikes" > "$FAILS"
+    if [ "$strikes" -lt "$CIRCUIT_STRIKES" ]; then
+        log "WARN circuit check failed ($strikes/$CIRCUIT_STRIKES) — not restarting yet"
+        exit 0
+    fi
+    reason="circuit check failed ${strikes}x"
+fi
+
+last=$(cat "$STAMP" 2>/dev/null)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+if [ $((now - last)) -lt "$RESTART_COOLDOWN" ]; then
+    log "SKIP ($reason) — cooldown"
+    exit 0
+fi
+
+echo "$now" > "$STAMP"
+echo 0 > "$FAILS"
+# reset-failed matters: without it a unit that tripped systemd's start limit
+# refuses to start no matter how often the watchdog asks.
+systemctl reset-failed "$SERVICE" >/dev/null 2>&1
+if systemctl restart "$SERVICE" >/dev/null 2>&1; then
+    log "RESTART ($reason) — ok"
+else
+    log "RESTART ($reason) — FAILED, check: journalctl -u $SERVICE"
+fi
+EOF
+    chmod 755 "$TOR_WATCHDOG_SCRIPT"
+
+    cat > "$TOR_WATCHDOG_CRON" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root $TOR_WATCHDOG_SCRIPT
+EOF
+    chmod 644 "$TOR_WATCHDOG_CRON"
+
+    if ! systemctl is-active --quiet cron 2>/dev/null && \
+       ! systemctl is-active --quiet crond 2>/dev/null; then
+        warn "No active cron daemon detected — watchdog will not run until cron/crond is started"
+    fi
+    ok "Tor watchdog enabled (cron: every 5 min, log: $TOR_WATCHDOG_LOG)"
+}
+
+remove_tor_watchdog() {
+    local was_enabled=false
+    tor_watchdog_enabled && was_enabled=true
+
+    pkill -f "$TOR_WATCHDOG_SCRIPT" 2>/dev/null || true
+    # Keep $TOR_WATCHDOG_LOG — the restart history is diagnostic data;
+    # uninstall_tor removes it explicitly.
+    rm -f "$TOR_WATCHDOG_CRON" "$TOR_WATCHDOG_SCRIPT" \
+          "$TOR_WATCHDOG_STAMP" "$TOR_WATCHDOG_FAILS"
+    rmdir "$(dirname "$TOR_WATCHDOG_SCRIPT")" 2>/dev/null || true
+
+    if [ "$was_enabled" = true ]; then
+        ok "Tor watchdog disabled"
+    else
+        info "Tor watchdog was not enabled — nothing to remove"
     fi
 }
 
-verify_tor_connection() {
-    # Check if Tor is listening on port 9050 (prefer ss; fall back to netstat)
-    ss -tlnp 2>/dev/null | grep -q ":9050" || netstat -tlnp 2>/dev/null | grep -q ":9050"
+tor_watchdog_enabled() {
+    [ -f "$TOR_WATCHDOG_CRON" ]
 }
 
 uninstall_tor() {
     step "Uninstalling Tor..."
-    
-    # Stop and disable service
-    if systemctl is-active --quiet "$TOR_SERVICE" 2>/dev/null; then
-        systemctl stop "$TOR_SERVICE" >/dev/null 2>&1
+
+    # remove_tor() does not run detect_os, so $OS was empty here and the
+    # package-removal case fell through silently — Tor stayed installed.
+    [ -z "${OS:-}" ] && detect_os
+
+    # Watchdog first, so cron cannot restart the unit mid-uninstall
+    remove_tor_watchdog
+
+    # Stop and disable BOTH unit names, not just the nominal one
+    local u
+    for u in $(tor_all_units); do
+        systemctl stop "$u" >/dev/null 2>&1 || true
+        systemctl disable "$u" >/dev/null 2>&1 || true
+    done
+
+    remove_tor_dropin
+
+    # A hand-written override left behind would be inherited by the next
+    # install — take it out of the way (backed up, never deleted outright).
+    local frag
+    frag=$(tor_override_path)
+    if [ -n "$frag" ]; then
+        local backup="${frag}.wtm-backup.$(date +%s)"
+        mv "$frag" "$backup" 2>/dev/null && \
+            info "Custom unit $frag moved to $backup"
     fi
-    if systemctl is-enabled --quiet "$TOR_SERVICE" 2>/dev/null; then
-        systemctl disable "$TOR_SERVICE" >/dev/null 2>&1
-    fi
-    
+
+    # Leave nothing masked or wedged in `failed` for the next install
+    for u in $(tor_all_units); do
+        systemctl unmask "$u" >/dev/null 2>&1 || true
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1
+    tor_unit_reset
+
     # Remove package
     case $OS in
         ubuntu|debian)
@@ -1326,11 +2133,16 @@ uninstall_tor() {
         centos|rhel|rocky|almalinux|fedora)
             yum remove -y tor >/dev/null 2>&1 || dnf remove -y tor >/dev/null 2>&1
             ;;
+        *)
+            warn "Unknown OS '$OS' — remove the tor package manually"
+            ;;
     esac
-    
-    # Remove configuration and data
+
+    # Remove configuration, data and wtm's own Tor state
     rm -rf /etc/tor /var/lib/tor /var/log/tor
-    
+    rm -f "$TOR_WATCHDOG_LOG" "$TOR_CIRCUIT_CACHE" "$TOR_CIRCUIT_CACHE.lock" \
+          "$TOR_CIRCUIT_CACHE.tmp"
+
     ok "Tor uninstalled successfully"
 }
 
@@ -1407,7 +2219,8 @@ get_service_memory() {
         # Попробуем через ps и pgrep
         local pids
         case "$service" in
-            "tor")
+            # tor@default too — pgrep -f on that name matches nothing
+            "tor"|"tor@"*)
                 pids=$(pgrep -x tor 2>/dev/null)
                 ;;
             *)
@@ -1466,17 +2279,39 @@ check_warp_status() {
     fi
 }
 
+# running      — unit active and the SOCKS listener is up
+# installed    — present, cleanly stopped, nothing wrong with the unit
+# broken       — present but wedged: failed, masked, or shadowed by a bad unit
+# not_installed
+#
+# The "broken" state is the whole point: previously a Tor that had been dead
+# for days was indistinguishable from one the operator had just stopped.
 check_tor_status() {
-    if systemctl is-active --quiet "$TOR_SERVICE" 2>/dev/null; then
+    local unit
+    unit=$(tor_unit)
+
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
         if verify_tor_connection; then
             echo "running"
         else
-            echo "installed"
+            echo "broken"
         fi
-    elif [ -f "$TOR_CONFIG_FILE" ]; then
-        echo "installed"
-    else
+        return 0
+    fi
+
+    if [ ! -f "$TOR_CONFIG_FILE" ] && ! command -v tor >/dev/null 2>&1; then
         echo "not_installed"
+        return 0
+    fi
+
+    if systemctl is-failed --quiet "$unit" 2>/dev/null; then
+        echo "broken"
+    elif [ "$(systemctl is-enabled "$unit" 2>/dev/null)" = "masked" ]; then
+        echo "broken"
+    elif tor_override_is_broken "$(tor_override_path)"; then
+        echo "broken"
+    else
+        echo "installed"
     fi
 }
 
@@ -1530,15 +2365,41 @@ show_status() {
     local tor_memory=""
     
     echo -e "\033[1;36m🧅 Tor:\033[0m"
+    local tor_unit_name
+    tor_unit_name=$(tor_unit)
     case $tor_status in
         "running")
-            tor_memory=$(get_service_memory "$TOR_SERVICE")
+            tor_memory=$(get_service_memory "$tor_unit_name")
             ok "Active and running (Memory: $tor_memory)"
-            echo -e "\033[38;5;250m   SOCKS5 Proxy: 127.0.0.1:9050\033[0m"
-            echo -e "\033[38;5;250m   Control Port: 127.0.0.1:9051\033[0m"
+            echo -e "\033[38;5;250m   Unit:         $tor_unit_name\033[0m"
+            echo -e "\033[38;5;250m   SOCKS5 Proxy: 127.0.0.1:$(tor_socks_port)\033[0m"
+            echo -e "\033[38;5;250m   Control Port: 127.0.0.1:$(tor_control_port)\033[0m"
+            local status_dns
+            status_dns=$(tor_dns_port)
+            [ "$status_dns" != "0" ] && echo -e "\033[38;5;250m   DNS Port:     127.0.0.1:$status_dns\033[0m"
+            case "$(tor_circuit_state)" in
+                ok)   echo -e "\033[1;32m   Circuit:      ✅ verified via check.torproject.org\033[0m" ;;
+                fail) echo -e "\033[1;31m   Circuit:      ❌ no working circuit — run: $(basename "$0") repair-tor\033[0m" ;;
+                *)    echo -e "\033[38;5;244m   Circuit:      ⏳ checking in background\033[0m" ;;
+            esac
+            tor_watchdog_enabled && echo -e "\033[38;5;250m   Watchdog:     enabled (cron */5)\033[0m"
             ;;
         "installed")
             warn "Installed but not running"
+            echo -e "\033[38;5;244m   Start it with: $(basename "$0") start-tor\033[0m"
+            ;;
+        "broken")
+            error "Installed but BROKEN — the service is not usable"
+            echo -e "\033[38;5;250m   Unit: $tor_unit_name ($(systemctl is-active "$tor_unit_name" 2>/dev/null || echo unknown))\033[0m"
+            systemctl is-failed --quiet "$tor_unit_name" 2>/dev/null && \
+                echo -e "\033[1;31m   State: failed\033[0m"
+            [ "$(systemctl is-enabled "$tor_unit_name" 2>/dev/null)" = "masked" ] && \
+                echo -e "\033[1;31m   State: masked (start requests are ignored)\033[0m"
+            local status_frag
+            status_frag=$(tor_override_path)
+            [ -n "$status_frag" ] && echo -e "\033[1;31m   Shadowed by: $status_frag\033[0m"
+            echo -e "\033[38;5;244m   Fix it with: $(basename "$0") repair-tor\033[0m"
+            echo -e "\033[38;5;244m   Logs: journalctl -u $tor_unit_name -n 30 --no-pager\033[0m"
             ;;
         "not_installed")
             info "Not installed"
@@ -1558,10 +2419,23 @@ show_logs() {
             fi
             ;;
         tor)
-            if systemctl is-active --quiet "$TOR_SERVICE" 2>/dev/null; then
-                journalctl -u "$TOR_SERVICE" -f --no-pager
+            local tor_log_unit
+            tor_log_unit=$(tor_unit)
+            # Refusing to show logs when the service is down hid exactly the
+            # output needed to find out WHY it is down.
+            if ! systemctl is-active --quiet "$tor_log_unit" 2>/dev/null; then
+                warn "Tor ($tor_log_unit) is not running — showing the most recent log anyway"
+            fi
+            # A torrc written by older wtm versions logs ONLY to a file, so
+            # the unit's journal is nearly empty. Follow whichever one
+            # actually carries Tor's notices.
+            if [ -f "$TOR_LOG_FILE" ] && \
+               ! grep -qE '^[[:space:]]*Log[[:space:]]+notice[[:space:]]+stdout' "$TOR_CONFIG_FILE" 2>/dev/null; then
+                info "Following $TOR_LOG_FILE (this torrc logs to a file only)"
+                echo -e "\033[38;5;244m   Unit events: journalctl -u $tor_log_unit -n 50\033[0m"
+                tail -n 50 -f "$TOR_LOG_FILE"
             else
-                error "Tor service is not running"
+                journalctl -u "$tor_log_unit" -n 50 -f --no-pager
             fi
             ;;
         *)
@@ -1581,13 +2455,22 @@ control_service() {
             local service_name="$WARP_SERVICE"
             ;;
         tor)
-            local service_name="$TOR_SERVICE"
+            local service_name
+            service_name=$(tor_unit)
             ;;
         *)
             error "Invalid service type: $service_type"
             return 1
             ;;
     esac
+
+    # A masked unit swallows `start` without an error and a unit wedged in
+    # `failed` by systemd's start limiter refuses to start at all. Clear both
+    # before asking, or "started" is a lie.
+    if [ "$service_type" = "tor" ] && [ "$action" != "stop" ]; then
+        systemctl unmask "$service_name" >/dev/null 2>&1 || true
+        systemctl reset-failed "$service_name" >/dev/null 2>&1 || true
+    fi
     
     local past
     case $action in
@@ -1606,6 +2489,19 @@ control_service() {
         if [ "$action" = "stop" ] && [ "$service_type" = "warp" ] && warp_watchdog_enabled; then
             warn "WARP watchdog is enabled — it will restart the service within 5 minutes"
             echo -e "\033[38;5;244m   To keep WARP stopped: wtm watchdog-off\033[0m"
+        fi
+        if [ "$action" = "stop" ] && [ "$service_type" = "tor" ] && tor_watchdog_enabled; then
+            warn "Tor watchdog is enabled — it will restart the service within 5 minutes"
+            echo -e "\033[38;5;244m   To keep Tor stopped: wtm tor-watchdog-off\033[0m"
+        fi
+        # systemctl returns 0 the moment the job is queued. For Tor that is
+        # long before it is usable, so confirm rather than assume.
+        if [ "$service_type" = "tor" ] && [ "$action" != "stop" ]; then
+            rm -f "$TOR_CIRCUIT_CACHE" 2>/dev/null
+            if ! wait_for_tor 90; then
+                warn "Tor started but has not bootstrapped — check the log above"
+                return 1
+            fi
         fi
     else
         error "Failed to $action $service_type service ($service_name)"
@@ -1664,22 +2560,25 @@ show_usage_examples() {
     echo -e "\033[38;5;250m   # Test WARP connection\033[0m"
     echo -e "\033[38;5;244m   curl --interface warp https://www.cloudflare.com/cdn-cgi/trace\033[0m"
     echo
-    echo -e "\033[38;5;250m   # Test Tor connection\033[0m"
-    echo -e "\033[38;5;244m   curl --socks5 127.0.0.1:9050 https://check.torproject.org\033[0m"
+    echo -e "\033[38;5;250m   # Test Tor connection (JSON: {\"IsTor\":true,\"IP\":\"...\"})\033[0m"
+    echo -e "\033[38;5;244m   curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip\033[0m"
+    echo
+    echo -e "\033[38;5;250m   # Repair a broken Tor unit\033[0m"
+    echo -e "\033[38;5;244m   sudo wtm repair-tor\033[0m"
     echo
     echo -e "\033[38;5;250m   # Check your IP through WARP\033[0m"
     echo -e "\033[38;5;244m   curl --interface warp https://ipinfo.io\033[0m"
     echo
     echo -e "\033[38;5;250m   # Check your IP through Tor\033[0m"
-    echo -e "\033[38;5;244m   curl --socks5 127.0.0.1:9050 https://ipinfo.io\033[0m"
+    echo -e "\033[38;5;244m   curl --socks5-hostname 127.0.0.1:9050 https://ipinfo.io\033[0m"
     echo
     
     echo -e "\033[1;32m🔧 System Commands:\033[0m"
     echo -e "\033[38;5;250m   # WARP interface status\033[0m"
     echo -e "\033[38;5;244m   wg show warp\033[0m"
     echo
-    echo -e "\033[38;5;250m   # Tor service status\033[0m"
-    echo -e "\033[38;5;244m   systemctl status tor\033[0m"
+    echo -e "\033[38;5;250m   # Tor service status (Debian/Ubuntu: tor@default, not tor)\033[0m"
+    echo -e "\033[38;5;244m   systemctl status tor@default\033[0m"
     echo
     echo -e "\033[38;5;250m   # Check listening ports\033[0m"
     echo -e "\033[38;5;244m   ss -tlnp | grep -E ':(9050|9051)'\033[0m"
@@ -1783,7 +2682,18 @@ show_help() {
     printf "• Run as root: ${GREEN}sudo wtm${NC}\n"
     printf "• Check logs if service fails to start\n"
     printf "• Disable conflicting VPNs\n\n"
-    
+
+    printf "${BOLD}${CYAN}Tor Troubleshooting:${NC}\n"
+    printf "• ${BOLD}BROKEN${NC} status → ${GREEN}sudo wtm repair-tor${NC}\n"
+    printf "  Unmasks the unit, clears a wedged 'failed' state, moves a broken\n"
+    printf "  hand-written /etc/systemd/system/tor.service aside and restarts.\n"
+    printf "• On Debian/Ubuntu the daemon is ${BOLD}tor@default.service${NC}, not\n"
+    printf "  tor.service — the latter is a do-nothing Type=oneshot master, so\n"
+    printf "  'systemctl is-active tor' can say active with no Tor running.\n"
+    printf "• ${BOLD}Circuit ❌${NC} with SOCKS5 ✅ means Tor is listening but has no\n"
+    printf "  route out (blocked datacenter, unreachable directory authorities).\n"
+    printf "• Enable ${GREEN}wtm tor-watchdog-on${NC} so a dead Tor cannot go unnoticed.\n\n"
+
     printf "${DIM}Press Enter to continue...${NC}"
     read -r
 }
@@ -1795,6 +2705,7 @@ status_color() {
     case "$1" in
         running)   echo "\033[1;32m" ;;
         installed) echo "\033[1;33m" ;;
+        broken)    echo "\033[1;31m" ;;
         *)         echo "\033[38;5;244m" ;;
     esac
 }
@@ -1841,26 +2752,74 @@ render_warp_status_block() {
 
 # Render the Tor status block. Shared by every menu. $1 = check_tor_status.
 render_tor_status_block() {
-    local tor_status="$1" color
+    local tor_status="$1" color unit socks control dns
     color=$(status_color "$tor_status")
+    unit=$(tor_unit)
     case $tor_status in
         running)
             echo -e "${color}✅ RUNNING\033[0m"
-            printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s\033[0m\n" "Memory:" "$(get_service_memory "$TOR_SERVICE")"
-            if check_port_listening 9050; then
-                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ 127.0.0.1:9050\033[0m\n" "SOCKS5:"
+            printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s\033[0m\n" "Memory:" "$(get_service_memory "$unit")"
+            socks=$(tor_socks_port)
+            control=$(tor_control_port)
+            dns=$(tor_dns_port)
+            if check_port_listening "$socks"; then
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ 127.0.0.1:%s\033[0m\n" "SOCKS5:" "$socks"
             else
                 printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Not accessible\033[0m\n" "SOCKS5:"
             fi
-            if check_port_listening 9051; then
-                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ 127.0.0.1:9051\033[0m\n" "Control:"
+            if check_port_listening "$control"; then
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ 127.0.0.1:%s\033[0m\n" "Control:" "$control"
             else
                 printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Not accessible\033[0m\n" "Control:"
+            fi
+            if [ "$dns" != "0" ]; then
+                if check_port_listening "$dns"; then
+                    printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ 127.0.0.1:%s\033[0m\n" "DNS:" "$dns"
+                else
+                    printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Configured but not listening\033[0m\n" "DNS:"
+                fi
+            fi
+            # An open socket is not a working Tor. Without this line a Tor
+            # that never bootstrapped reads as fully healthy here.
+            case "$(tor_circuit_state)" in
+                ok)
+                    printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Verified via Tor\033[0m\n" "Circuit:" ;;
+                fail)
+                    printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ No working circuit\033[0m\n" "Circuit:"
+                    echo -e "\033[38;5;244m   Listening but traffic does not traverse Tor — try: $(basename "$0") repair-tor\033[0m" ;;
+                *)
+                    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;244m⏳ checking...\033[0m\n" "Circuit:" ;;
+            esac
+            if tor_watchdog_enabled; then
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Enabled\033[0m \033[38;5;250m(cron */5)\033[0m\n" "Watchdog:"
+            else
+                printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m⚪ Disabled (wtm tor-watchdog-on)\033[0m\n" "Watchdog:"
             fi
             ;;
         installed)
             echo -e "${color}⚠️  INSTALLED BUT STOPPED\033[0m"
+            if tor_watchdog_enabled; then
+                echo -e "\033[1;33m   Watchdog is enabled — will auto-restart within 5 min\033[0m"
+                echo -e "\033[38;5;244m   (wtm tor-watchdog-off to keep Tor stopped)\033[0m"
+            fi
             echo -e "\033[38;5;244m   Use Tor menu to start service\033[0m"
+            ;;
+        broken)
+            echo -e "${color}❌ INSTALLED BUT BROKEN\033[0m"
+            printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s (%s)\033[0m\n" "Unit:" "$unit" \
+                "$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+            if systemctl is-failed --quiet "$unit" 2>/dev/null; then
+                echo -e "\033[1;31m   Unit is in the failed state\033[0m"
+            fi
+            if [ "$(systemctl is-enabled "$unit" 2>/dev/null)" = "masked" ]; then
+                echo -e "\033[1;31m   Unit is MASKED — start requests are silently ignored\033[0m"
+            fi
+            local frag
+            frag=$(tor_override_path)
+            if [ -n "$frag" ]; then
+                echo -e "\033[1;31m   Shadowed by a hand-written unit: $frag\033[0m"
+            fi
+            echo -e "\033[38;5;244m   Fix it with: $(basename "$0") repair-tor\033[0m"
             ;;
         not_installed)
             echo -e "${color}📦 NOT INSTALLED\033[0m"
@@ -2011,25 +2970,34 @@ show_tor_menu() {
     echo -e "\033[1;37m⚙️  Configuration:\033[0m"
     echo -e "   \033[38;5;15m9)\033[0m 🔧 Edit Tor configuration"
     echo -e "   \033[38;5;15m10)\033[0m 🔄 Regenerate identity"
+    echo -e "   \033[38;5;15m11)\033[0m 🩺 Repair Tor service"
+    if tor_watchdog_enabled; then
+        echo -e "   \033[38;5;15m12)\033[0m 🐶 Disable Tor watchdog \033[38;5;250m(currently on)\033[0m"
+    else
+        echo -e "   \033[38;5;15m12)\033[0m 🐶 Enable Tor watchdog \033[38;5;250m(currently off)\033[0m"
+    fi
     echo
     echo -e "\033[38;5;8m$(printf '─%.0s' $(seq 1 45))\033[0m"
     echo -e "\033[38;5;15m   0)\033[0m ← Back to main menu"
     echo
-    
+
     case $tor_status in
         "not_installed")
             echo -e "\033[1;34m💡 Tip: Install Tor (1) to enable anonymous browsing\033[0m"
             ;;
         "installed")
-            echo -e "\033[1;34m💡 Tip: Start Tor (2) to enable SOCKS5 proxy on port 9050\033[0m"
+            echo -e "\033[1;34m💡 Tip: Start Tor (2) to enable the SOCKS5 proxy on port $(tor_socks_port)\033[0m"
+            ;;
+        "broken")
+            echo -e "\033[1;31m💡 Tip: Tor is installed but not usable — run Repair (11)\033[0m"
             ;;
         "running")
             echo -e "\033[1;34m💡 Tip: Test connection (8) to verify Tor is working correctly\033[0m"
             ;;
     esac
-    
+
     echo
-    read -p "$(echo -e "\033[1;37mSelect option [0-10]:\033[0m ")" choice
+    read -p "$(echo -e "\033[1;37mSelect option [0-12]:\033[0m ")" choice
 }
 
 # Подменю быстрых действий
@@ -2054,6 +3022,7 @@ show_quick_actions_menu() {
     case $tor_status in
         "running") echo -e "\033[1;32m✅ Running\033[0m" ;;
         "installed") echo -e "\033[1;33m⚠️  Stopped\033[0m" ;;
+        "broken") echo -e "\033[1;31m❌ Broken (wtm repair-tor)\033[0m" ;;
         "not_installed") echo -e "\033[38;5;244m📦 Not installed\033[0m" ;;
     esac
     
@@ -2106,7 +3075,7 @@ show_usage_examples_page() {
     printf "${BOLD}${CYAN}Tor (via SOCKS5 proxy):${NC}\n\n"
     
     printf "${BOLD}curl with Tor:${NC}\n"
-    printf "${GREEN}curl --socks5 127.0.0.1:9050 https://ifconfig.me${NC}\n\n"
+    printf "${GREEN}curl --socks5-hostname 127.0.0.1:9050 https://ifconfig.me${NC}\n\n"
     
     printf "${BOLD}SSH through Tor:${NC}\n"
     printf "${GREEN}ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:9050 %%h %%p' user@server${NC}\n\n"
@@ -2128,7 +3097,7 @@ show_testing_commands_page() {
     printf "${BOLD}${CYAN}Check Your IP:${NC}\n"
     printf "${GREEN}curl ifconfig.me${NC} ${DIM}# Direct connection${NC}\n"
     printf "${GREEN}curl --interface warp ifconfig.me${NC} ${DIM}# Through WARP${NC}\n"
-    printf "${GREEN}curl --socks5 127.0.0.1:9050 ifconfig.me${NC} ${DIM}# Through Tor${NC}\n\n"
+    printf "${GREEN}curl --socks5-hostname 127.0.0.1:9050 ifconfig.me${NC} ${DIM}# Through Tor${NC}\n\n"
     
     printf "${BOLD}${CYAN}Test WARP Interface:${NC}\n"
     printf "${GREEN}wg show warp${NC} ${DIM}# Check WireGuard interface${NC}\n"
@@ -2137,17 +3106,23 @@ show_testing_commands_page() {
     printf "${BOLD}${CYAN}Test Tor Connection:${NC}\n"
     printf "${GREEN}ss -tuln | grep ':9050'${NC} ${DIM}# Check SOCKS5 port${NC}\n"
     printf "${GREEN}ss -tuln | grep ':9051'${NC} ${DIM}# Check control port${NC}\n"
-    printf "${GREEN}curl --socks5 127.0.0.1:9050 ifconfig.me${NC} ${DIM}# Test connection${NC}\n\n"
+    printf "${GREEN}curl --socks5-hostname 127.0.0.1:9050 ifconfig.me${NC} ${DIM}# Test connection${NC}\n\n"
     
     printf "${BOLD}${CYAN}Cloudflare WARP Test:${NC}\n"
     printf "${GREEN}curl --interface warp https://www.cloudflare.com/cdn-cgi/trace${NC}\n\n"
     
     printf "${BOLD}${CYAN}Tor Project Test:${NC}\n"
-    printf "${GREEN}curl --socks5 127.0.0.1:9050 https://check.torproject.org${NC}\n\n"
+    printf "${GREEN}curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip${NC}\n"
+    printf "${DIM}# {\"IsTor\":true,\"IP\":\"...\"} — anything else means traffic is NOT going through Tor${NC}\n\n"
+
+    printf "${BOLD}${CYAN}Tor Service Health:${NC}\n"
+    printf "${GREEN}systemctl status tor@default${NC} ${DIM}# the real unit on Debian/Ubuntu${NC}\n"
+    printf "${GREEN}journalctl -u tor@default -n 50 --no-pager${NC}\n"
+    printf "${GREEN}sudo wtm repair-tor${NC} ${DIM}# unmask + reset-failed + restart${NC}\n\n"
     
     printf "${BOLD}${CYAN}Speed Tests:${NC}\n"
     printf "${GREEN}curl --interface warp -o /dev/null -s -w \"%%{time_total}\\n\" https://speedtest.net${NC}\n"
-    printf "${GREEN}curl --socks5 127.0.0.1:9050 -o /dev/null -s -w \"%%{time_total}\\n\" https://speedtest.net${NC}\n\n"
+    printf "${GREEN}curl --socks5-hostname 127.0.0.1:9050 -o /dev/null -s -w \"%%{time_total}\\n\" https://speedtest.net${NC}\n\n"
     
     printf "${DIM}Press Enter to continue...${NC}"
     read -r
@@ -2365,41 +3340,70 @@ test_connections() {
     echo -e "\033[1;37m🧅 Testing Tor...\033[0m"
     local tor_status=$(check_tor_status)
     
+    local tor_socks tor_control tor_dns tor_circuit_ok=false
+    tor_socks=$(tor_socks_port)
+    tor_control=$(tor_control_port)
+    tor_dns=$(tor_dns_port)
+
     if [ "$tor_status" = "running" ]; then
-        # Проверяем SOCKS5 порт
-        if check_port_listening 9050; then
-            printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Accessible\033[0m\n" "SOCKS5:"
-            
-            # Тестируем соединение через Tor
-            local tor_ip=$(curl -s --max-time 15 --socks5 127.0.0.1:9050 https://ifconfig.me 2>/dev/null || echo "Failed")
-            if [ "$tor_ip" != "Failed" ]; then
-                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ %s\033[0m\n" "Tor IP:" "$tor_ip"
-                if [ "$direct_ip" != "$tor_ip" ]; then
-                    printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Working correctly\033[0m\n" "Status:"
-                else
-                    printf "   \033[38;5;15m%-12s\033[0m \033[1;33m⚠️  IP not changed\033[0m\n" "Status:"
-                fi
-            else
-                printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Connection failed\033[0m\n" "Tor IP:"
-            fi
-            
-            # Проверяем через Tor Project
-            local tor_check=$(curl -s --max-time 15 --socks5 127.0.0.1:9050 https://check.torproject.org 2>/dev/null | grep -o "Congratulations" || echo "Failed")
-            if [ "$tor_check" = "Congratulations" ]; then
+        printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s\033[0m\n" "Unit:" "$(tor_unit)"
+
+        if check_port_listening "$tor_socks"; then
+            printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Accessible (127.0.0.1:%s)\033[0m\n" "SOCKS5:" "$tor_socks"
+
+            # ONE request answers both questions. --socks5-hostname, not
+            # --socks5: the latter resolves DNS on this host, leaking the
+            # lookup around Tor and failing outright when resolv.conf is
+            # broken — which showed up as a bogus "Connection failed".
+            local tor_api
+            tor_api=$(curl -s --max-time 20 --socks5-hostname "127.0.0.1:$tor_socks" \
+                        https://check.torproject.org/api/ip 2>/dev/null) || tor_api=""
+
+            if printf '%s' "$tor_api" | grep -qE '"IsTor"[[:space:]]*:[[:space:]]*true'; then
+                tor_circuit_ok=true
+                local tor_ip
+                tor_ip=$(printf '%s' "$tor_api" | grep -oE '"IP"[[:space:]]*:[[:space:]]*"[^"]+"' | \
+                         sed 's/.*"\([^"]*\)"$/\1/')
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ %s\033[0m\n" "Tor IP:" "${tor_ip:-unknown}"
                 printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Verified by Tor Project\033[0m\n" "Tor Check:"
+                if [ -n "$tor_ip" ] && [ "$direct_ip" = "$tor_ip" ]; then
+                    printf "   \033[38;5;15m%-12s\033[0m \033[1;33m⚠️  Exit IP equals the direct IP\033[0m\n" "Status:"
+                else
+                    printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Working correctly\033[0m\n" "Status:"
+                fi
+            elif [ -n "$tor_api" ]; then
+                # Reached something, but not through Tor — a leak, not a win.
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Reachable but NOT via Tor\033[0m\n" "Tor Check:"
+                printf "   \033[38;5;244m   %s\033[0m\n" "$(printf '%s' "$tor_api" | head -c 120)"
             else
-                printf "   \033[38;5;15m%-12s\033[0m \033[1;33m⚠️  Could not verify\033[0m\n" "Tor Check:"
+                # The exact failure the status screen used to hide: the port
+                # is open, but no circuit exists.
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ No response through the SOCKS proxy\033[0m\n" "Tor Check:"
+                local boot
+                boot=$(tor_bootstrap_line)
+                [ -n "$boot" ] && printf "   \033[38;5;244m   %s\033[0m\n" "$boot"
+                echo -e "\033[38;5;244m   Tor is listening but has no working circuit — run: $(basename "$0") repair-tor\033[0m"
             fi
         else
-            printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Port 9050 not accessible\033[0m\n" "SOCKS5:"
+            printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Port %s not accessible\033[0m\n" "SOCKS5:" "$tor_socks"
         fi
-        
-        # Проверяем контрольный порт
-        if check_port_listening 9051; then
-            printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Accessible\033[0m\n" "Control:"
+
+        if check_port_listening "$tor_control"; then
+            printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Accessible (127.0.0.1:%s)\033[0m\n" "Control:" "$tor_control"
         else
-            printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Port 9051 not accessible\033[0m\n" "Control:"
+            printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Port %s not accessible\033[0m\n" "Control:" "$tor_control"
         fi
+
+        if [ "$tor_dns" != "0" ]; then
+            if check_port_listening "$tor_dns"; then
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Accessible (127.0.0.1:%s)\033[0m\n" "DNS:" "$tor_dns"
+            else
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Configured but not listening on %s\033[0m\n" "DNS:" "$tor_dns"
+            fi
+        fi
+    elif [ "$tor_status" = "broken" ]; then
+        printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Installed but broken\033[0m\n" "Status:"
+        echo -e "\033[38;5;244m   Run: $(basename "$0") repair-tor\033[0m"
     else
         printf "   \033[38;5;15m%-12s\033[0m \033[38;5;244m📦 Service not running\033[0m\n" "Status:"
     fi
@@ -2413,7 +3417,9 @@ test_connections() {
     if [ "$warp_status" = "running" ] && wg show warp >/dev/null 2>&1; then
         working_services=$((working_services + 1))
     fi
-    if [ "$tor_status" = "running" ] && check_port_listening 9050; then
+    # Count Tor as working only when traffic actually traverses it — an open
+    # SOCKS port on a Tor with no circuits is not a working service.
+    if [ "$tor_circuit_ok" = true ]; then
         working_services=$((working_services + 1))
     fi
     
@@ -2581,7 +3587,7 @@ auto_install_script_if_needed() {
         info "Installing WTM script globally for easy access..."
         echo -e "\033[38;5;244m   This will allow you to use 'wtm' command from anywhere\033[0m"
 
-        if download_and_install_wtm; then
+        if install_wtm_best_available; then
             ok "✅ WTM script installed successfully at /usr/local/bin/wtm"
             echo -e "\033[1;37m💡 You can now use 'wtm' command from anywhere!\033[0m"
             echo
@@ -2593,7 +3599,7 @@ auto_install_script_if_needed() {
 
 install_wtm_script_globally() {
     info "Installing WARP & Tor Manager script globally..."
-    if download_and_install_wtm; then
+    if install_wtm_best_available; then
         ok "WTM script installed successfully at /usr/local/bin/wtm"
     else
         error_exit "Failed to install WTM script globally"
@@ -2708,14 +3714,14 @@ main() {
             restart-warp)
                 control_service restart warp
                 ;;
-            watchdog-on)
+            watchdog-on|warp-watchdog-on)
                 if [ ! -f "$WARP_CONFIG_FILE" ]; then
                     error "WARP is not installed — run: $(basename "$0") install-warp"
                     exit 1
                 fi
                 install_warp_watchdog
                 ;;
-            watchdog-off)
+            watchdog-off|warp-watchdog-off)
                 remove_warp_watchdog
                 ;;
             start-tor)
@@ -2726,6 +3732,23 @@ main() {
                 ;;
             restart-tor)
                 control_service restart tor
+                ;;
+            repair-tor|fix-tor)
+                print_banner
+                repair_tor
+                ;;
+            tor-watchdog-on)
+                if [ ! -f "$TOR_CONFIG_FILE" ] && ! command -v tor >/dev/null 2>&1; then
+                    error "Tor is not installed — run: $(basename "$0") install-tor"
+                    exit 1
+                fi
+                install_tor_watchdog
+                ;;
+            tor-watchdog-off)
+                remove_tor_watchdog
+                ;;
+            new-identity|newnym)
+                tor_new_identity
                 ;;
             regen-warp-xray|warp-reserved)
                 regen_warp_xray_outbound
@@ -2746,7 +3769,9 @@ main() {
                 check_for_updates
                 ;;
             self-update|update)
-                self_update
+                # Returns 1 when there is deliberately nothing to do (already
+                # current, or refusing to downgrade) — not an error worth a trap.
+                self_update || true
                 ;;
             help|--help|-h)
                 usage
@@ -2822,14 +3847,21 @@ main() {
                             fi
                             ;;
                         10)
-                            if systemctl is-active --quiet "$TOR_SERVICE" 2>/dev/null; then
-                                if systemctl reload "$TOR_SERVICE" >/dev/null 2>&1; then
-                                    echo "Tor identity regenerated"
-                                else
-                                    echo "Failed to reload Tor (check: journalctl -u $TOR_SERVICE)"
-                                fi
+                            if systemctl is-active --quiet "$(tor_unit)" 2>/dev/null; then
+                                tor_new_identity
                             else
-                                echo "Tor service is not running"
+                                error "Tor service is not running"
+                            fi
+                            read -p "Press Enter to continue..."
+                            ;;
+                        11) repair_tor; read -p "Press Enter to continue..." ;;
+                        12)
+                            if tor_watchdog_enabled; then
+                                remove_tor_watchdog
+                            elif [ -f "$TOR_CONFIG_FILE" ] || command -v tor >/dev/null 2>&1; then
+                                install_tor_watchdog
+                            else
+                                error "Tor is not installed — nothing for the watchdog to watch"
                             fi
                             read -p "Press Enter to continue..."
                             ;;

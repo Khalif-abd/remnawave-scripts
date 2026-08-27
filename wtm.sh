@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WARP & Tor Network Setup Script
 # This script installs and manages Cloudflare WARP and Tor connections
-# VERSION=1.6.0
+# VERSION=1.6.1
 
 # NB: this is an interactive, status-returning menu script. We deliberately do
 # NOT use `set -e` (errexit): many functions return non-zero as a normal status
@@ -9,7 +9,7 @@
 # break the menu loop. We keep `set -E` (errtrace) so the ERR trap below can
 # surface genuinely unexpected failures for diagnostics without exiting.
 set -E
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Error handler for debugging (diagnostic only — never exits)
@@ -1489,6 +1489,53 @@ tor_prepare_unit() {
     tor_unit_reset
 }
 
+# The account the daemon actually runs as: debian-tor on Debian/Ubuntu,
+# toranon or tor on the RHEL family. Ask the unit first — it is authoritative.
+tor_run_user() {
+    local u
+    u=$(systemctl show -p User --value "$(tor_unit)" 2>/dev/null) || u=""
+    if [ -n "$u" ] && id -u "$u" >/dev/null 2>&1; then
+        echo "$u"
+        return 0
+    fi
+    for u in debian-tor toranon tor; do
+        if id -u "$u" >/dev/null 2>&1; then
+            echo "$u"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Validate torrc the way the UNIT starts tor, not the way root would.
+#
+# Plain `tor --verify-config -f torrc` run as root fails on a perfectly good
+# Debian install: tor checks DataDirectory ownership against the user it
+# expects to run as, sees /var/lib/tor owned by debian-tor, and refuses with
+# "Couldn't access private data directory". The packaged unit avoids this by
+# passing --defaults-torrc (which carries `User debian-tor`), so mirror that,
+# and fall back to pinning --User explicitly.
+# Prints tor's own diagnostics on failure.
+tor_verify_config() {
+    local defaults="/usr/share/tor/tor-service-defaults-torrc" out user
+    local -a base=(tor --verify-config -f "$TOR_CONFIG_FILE")
+    [ -f "$defaults" ] && base+=(--defaults-torrc "$defaults")
+
+    if out=$("${base[@]}" 2>&1); then
+        return 0
+    fi
+
+    user=$(tor_run_user) || user=""
+    if [ -n "$user" ]; then
+        if out=$("${base[@]}" --User "$user" 2>&1); then
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$out"
+    return 1
+}
+
 ensure_tor_runtime_dirs() {
     mkdir -p /etc/tor /var/log/tor
     chown debian-tor:debian-tor /var/log/tor 2>/dev/null || \
@@ -1784,9 +1831,16 @@ EOF
 
     # Reject a bad config before restarting into a crash loop.
     if command -v tor >/dev/null 2>&1; then
-        if ! tor --verify-config -f "$TOR_CONFIG_FILE" >/dev/null 2>&1; then
+        local verify_out
+        if ! verify_out=$(tor_verify_config); then
             error "Generated torrc failed Tor's own validation"
-            tor --verify-config -f "$TOR_CONFIG_FILE" 2>&1 | tail -5 | sed 's/^/   /'
+            printf '%s\n' "$verify_out" | tail -8 | sed 's/^/   /'
+            # Do not leave a config tor rejects sitting in place — put the
+            # previous one back so the box is no worse off than before.
+            if [ -n "${torrc_backup:-}" ] && [ -f "$torrc_backup" ]; then
+                cp "$torrc_backup" "$TOR_CONFIG_FILE" 2>/dev/null && \
+                    info "Previous config restored from $torrc_backup"
+            fi
             return 1
         fi
     fi

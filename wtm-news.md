@@ -1,3 +1,51 @@
+# 🩹 WTM v1.6.1 — hotfix: установка Tor на Debian/Ubuntu
+
+> Срочная заплатка к v1.6.0. Если вы обновились до 1.6.0 — обновитесь до 1.6.1 **до** того, как ставить Tor.
+
+## Симптом
+
+`sudo wtm install-tor` падал сразу после записи конфига:
+
+```
+ℹ️  Configuring Tor...
+ℹ️  Previous config backed up to /etc/tor/torrc.backup.20260827-133546
+❌ Generated torrc failed Tor's own validation
+   [warn] /var/lib/tor is not owned by this user (root, 0) but by debian-tor (110).
+   [warn] Failed to parse/validate config: Couldn't access private data directory "/var/lib/tor"
+   [err] Reading config failed--see warnings above.
+```
+
+## Причина
+
+Виновата новая проверка конфига из 1.6.0, а не сам конфиг. В 1.6.0 перед перезапуском добавился прогон `tor --verify-config`, чтобы не влетать в crash-loop с битым `torrc`. Но запускался он **от root и без файла defaults**, а штатный юнит стартует Tor совсем иначе:
+
+```
+ExecStart=/usr/bin/tor --defaults-torrc /usr/share/tor/tor-service-defaults-torrc -f /etc/tor/torrc ...
+User=debian-tor
+```
+
+Tor сверяет владельца `DataDirectory` с тем пользователем, под которым **собирается работать**. От root, без `--defaults-torrc` (а именно там лежит `User debian-tor`), он видит `/var/lib/tor`, принадлежащий `debian-tor`, и отказывается — хотя конфиг полностью корректен.
+
+Ирония в том, что это ровно та же ошибка, от которой лечит вся версия 1.6.0: проверка воспроизводила не то, как сервис работает на самом деле.
+
+## Что исправлено
+
+* `tor_verify_config()` теперь валидирует так же, как стартует юнит: подхватывает `--defaults-torrc`, если он есть, и при неудаче повторяет проверку с явным `--User`.
+* `tor_run_user()` определяет учётку демона из самого юнита (`systemctl show -p User`), с запасным списком `debian-tor` / `toranon` / `tor` — покрывает и Debian/Ubuntu, и RHEL-семейство.
+* Если конфиг всё-таки не проходит проверку, **предыдущий `torrc` возвращается из бэкапа** — прерванная установка больше не оставляет систему с отвергнутым конфигом.
+* Действительно битый конфиг по-прежнему отбраковывается, с выводом причины от самого Tor.
+
+## Обновление
+
+```bash
+sudo wtm self-update
+sudo wtm install-tor --force
+```
+
+Если установка уже прерывалась на 1.6.0, система осталась в промежуточном состоянии: пакет tor стоит, `torrc` записан, сервис не поднят. `install-tor --force` приводит всё в порядок; ваш прежний конфиг лежит рядом в `torrc.backup.<дата-время>`.
+
+---
+
 # 🌐 WTM v1.6.0 — Tor больше не врёт о своём состоянии
 
 > Привет 👋

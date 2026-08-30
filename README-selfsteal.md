@@ -2,7 +2,7 @@
 
 # 🎭 Selfsteal — Caddy/Nginx для Reality
 
-[![Версия](https://img.shields.io/badge/selfsteal.sh-2.10.0-blue.svg)](#-что-нового)
+[![Версия](https://img.shields.io/badge/selfsteal.sh-2.10.1-blue.svg)](#-что-нового)
 [![Веб-сервер](https://img.shields.io/badge/Caddy_%7C_Nginx-supported-brightgreen.svg)](#-сравнение-caddy-vs-nginx)
 [![Шаблоны](https://img.shields.io/badge/шаблонов-11_AI--generated-purple.svg)](#-шаблоны-сайтов)
 [![Лицензия MIT](https://img.shields.io/badge/Лицензия-MIT-yellow.svg)](./LICENSE)
@@ -21,6 +21,7 @@
 
 | Версия | Главное |
 |---|---|
+| **2.10.1** | Исправлен выпуск SSL для Nginx: ACME-контакт больше не собирается из `hostname` (`user35123@debian.debian` отклонялся Let's Encrypt), битый аккаунт чинится автоматически ([#47](https://github.com/DigneZzZ/remnawave-scripts/issues/47)) |
 | **2.10.0** | `selfsteal reissue-cert` — принудительный перевыпуск сертификата Caddy одной командой (с бэкапом и автооткатом при неудаче) |
 | **2.9.0** | Устойчивое получение Docker-образов: fallback на зеркала, когда Docker Hub недоступен/заблокирован |
 | **2.8.x** | Антифингерпринт-мутация шаблонов при установке, HTTP/3 выключен по умолчанию (`--h3` для включения), Caddy 2.11.4, `admin off` против boot-loop |
@@ -237,6 +238,13 @@ selfsteal status                  # статус + информация о се�
 ```
 
 Для Nginx ACME нужен свободный порт из ряда 8443+ (или задайте `--acme-port`); порт нужен только на время выпуска/обновления.
+
+До v2.10.1 email ACME-аккаунта собирался из `hostname -f`, из-за чего на типовом VPS получалось `user35123@debian.debian` — Let's Encrypt такой контакт отклоняет (*contact email has invalid domain*), а скрипт затем перебирал резервные порты и выдавал это за проблему с портами. С v2.10.1 контактом становится `admin@<ваш-домен>`, а уже сохранённый битый аккаунт чинится автоматически. Ручное лечение на старых версиях:
+
+```bash
+rm -rf ~/.acme.sh/ca/acme-v02.api.letsencrypt.org
+~/.acme.sh/acme.sh --register-account -m you@example.com
+```
 
 </details>
 

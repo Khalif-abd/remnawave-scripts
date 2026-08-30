@@ -7,9 +7,9 @@
 # ║  Author:  DigneZzZ (https://github.com/DigneZzZ)               ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=2.10.0
+# VERSION=2.10.1
 
-SCRIPT_VERSION="2.10.0"
+SCRIPT_VERSION="2.10.1"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -60,6 +60,10 @@ ACME_HOME="$HOME/.acme.sh"
 ACME_INSTALL_URL="https://get.acme.sh"
 ACME_PORT=""  # Will be auto-detected or set via --acme-port
 ACME_FALLBACK_PORTS=(8443 9443 10443 18443 28443)
+# TLDs that Let's Encrypt refuses as an account contact domain
+ACME_RESERVED_TLDS="local localdomain localhost lan home internal intranet corp private invalid test example onion arpa"
+# Set when the CA rejects something that retrying on another port cannot fix
+ACME_FATAL_ERROR=""
 
 # Force mode - skip DNS validation and interactive prompts
 FORCE_MODE=false
@@ -280,8 +284,131 @@ check_acme_installed() {
     return 1
 }
 
+# Build the ACME account contact address for a domain.
+# The certificate domain is by definition a real registrable name, so it is
+# always an address Let's Encrypt accepts. Empty output means "no contact".
+acme_account_email() {
+    local domain="${1:-}"
+    domain="${domain#\*.}"   # *.example.com -> example.com
+    if [ -n "$domain" ]; then
+        echo "admin@$domain"
+    fi
+}
+
+# Validate an address for use as an ACME account contact.
+# Let's Encrypt rejects contacts whose domain has no valid public suffix, e.g.
+# the "user35123@debian.debian" addresses older versions built from `hostname -f`.
+acme_email_is_valid() {
+    local email="${1:-}"
+    [ -n "$email" ] || return 1
+
+    # Shape: local-part@domain.tld
+    if ! [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        return 1
+    fi
+
+    local local_part="${email%@*}"
+    local domain_part="${email#*@}"
+    local tld lower_tld reserved
+    tld="${domain_part##*.}"
+    lower_tld=$(printf '%s' "$tld" | tr 'A-Z' 'a-z')
+
+    for reserved in $ACME_RESERVED_TLDS; do
+        if [ "$lower_tld" = "$reserved" ]; then
+            return 1
+        fi
+    done
+
+    # Built from the machine hostname (debian.debian, srv1.localdomain, ...)
+    local host_fqdn host_short
+    host_fqdn=$(hostname -f 2>/dev/null || echo "")
+    host_short=$(hostname 2>/dev/null || echo "")
+    if [ -n "$host_fqdn" ] && [ "$domain_part" = "$host_fqdn" ]; then
+        return 1
+    fi
+    if [ -n "$host_short" ] && [ "$domain_part" = "$host_short" ]; then
+        return 1
+    fi
+
+    # Signature of the old generator: user<5 digits>@<single-word-ish host>
+    if [[ "$local_part" =~ ^user[0-9]{5}$ ]] && [ "${domain_part%%.*}" = "${domain_part##*.}" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Repair an unusable ACME account contact left behind by earlier versions.
+# https://github.com/DigneZzZ/remnawave-scripts/issues/47
+ensure_valid_acme_account() {
+    local domain="${1:-}"
+    local conf="$ACME_HOME/account.conf"
+
+    check_acme_installed || return 0
+
+    local current_email=""
+    if [ -f "$conf" ]; then
+        current_email=$(grep -m1 "^ACCOUNT_EMAIL=" "$conf" 2>/dev/null | cut -d'=' -f2- | tr -d "'\"" )
+    fi
+
+    if acme_email_is_valid "$current_email"; then
+        [ "$DEBUG_MODE" = true ] && echo "DEBUG: ACME account email '$current_email' looks valid"
+        return 0
+    fi
+
+    local new_email
+    new_email=$(acme_account_email "$domain")
+
+    if [ -n "$new_email" ]; then
+        log_warning "ACME account email is not usable${current_email:+ ($current_email)}, replacing with $new_email"
+    else
+        log_warning "ACME account email is not usable${current_email:+ ($current_email)}, registering without a contact"
+    fi
+
+    # Rewrite ACCOUNT_EMAIL (rewrite the file rather than sed -i, which is not
+    # portable and would silently leave the bad address in place)
+    local tmp_conf="${conf}.tmp.$$"
+    if [ -f "$conf" ]; then
+        grep -v "^ACCOUNT_EMAIL=" "$conf" > "$tmp_conf" 2>/dev/null || true
+    else
+        : > "$tmp_conf"
+    fi
+    if [ -n "$new_email" ]; then
+        echo "ACCOUNT_EMAIL='$new_email'" >> "$tmp_conf"
+    fi
+    if ! mv "$tmp_conf" "$conf"; then
+        rm -f "$tmp_conf" 2>/dev/null || true
+        log_error "Could not update $conf"
+        return 1
+    fi
+    chmod 600 "$conf" 2>/dev/null || true
+
+    # Drop the account cached under the rejected contact so acme.sh registers
+    # a fresh one instead of replaying the same failure
+    rm -rf "$ACME_HOME/ca/acme-v02.api.letsencrypt.org" 2>/dev/null || true
+
+    # Register up front, so a contact problem is reported here instead of
+    # being buried in the certificate issuance output
+    local reg_args=(--register-account --server letsencrypt)
+    [ -n "$new_email" ] && reg_args+=(-m "$new_email")
+
+    local reg_output="" reg_code=0
+    reg_output=$("$ACME_HOME/acme.sh" "${reg_args[@]}" 2>&1) || reg_code=$?
+
+    if [ $reg_code -eq 0 ]; then
+        log_success "ACME account registered"
+        return 0
+    fi
+
+    log_error "Failed to register ACME account with Let's Encrypt"
+    echo "$reg_output" | tail -10
+    return 1
+}
+
 # Install acme.sh
+# $1 - domain the certificate is for, used as the account contact domain
 install_acme() {
+    local domain="${1:-}"
     log_info "Installing acme.sh..."
     
     # Disable exit on error and pipefail for this function
@@ -309,10 +436,16 @@ install_acme() {
     
     [ "$DEBUG_MODE" = true ] && echo "DEBUG: acme.sh not found at $ACME_HOME/acme.sh"
     
-    # Generate random email for registration
-    local random_email="user$(shuf -i 10000-99999 -n 1)@$(hostname -f 2>/dev/null || echo 'localhost.local')"
+    # Account contact. Never derive it from the hostname: Let's Encrypt rejects
+    # domains without a valid public suffix (debian.debian, srv.localdomain, ...)
+    local acme_email
+    acme_email=$(acme_account_email "$domain")
     
-    echo -e "${GRAY}   Email: $random_email${NC}"
+    if [ -n "$acme_email" ]; then
+        echo -e "${GRAY}   Email: $acme_email${NC}"
+    else
+        echo -e "${GRAY}   Email: (none, account registered without a contact)${NC}"
+    fi
     echo -e "${GRAY}   Downloading and installing acme.sh...${NC}"
     
     # Download script first, then execute (more reliable than pipe)
@@ -327,7 +460,11 @@ install_acme() {
             echo -e "${GRAY}   Running acme.sh installer...${NC}"
             [ "$DEBUG_MODE" = true ] && echo "DEBUG: Script size: $(wc -c < "$temp_script") bytes"
             
-            install_output=$(sh "$temp_script" email="$random_email" 2>&1) || install_exit_code=$?
+            if [ -n "$acme_email" ]; then
+                install_output=$(sh "$temp_script" email="$acme_email" 2>&1) || install_exit_code=$?
+            else
+                install_output=$(sh "$temp_script" 2>&1) || install_exit_code=$?
+            fi
             echo -e "${GRAY}   Installer finished with code: $install_exit_code${NC}"
             
             [ "$DEBUG_MODE" = true ] && echo "DEBUG: Install output:"
@@ -381,7 +518,11 @@ install_acme() {
         if git clone --depth 1 https://github.com/acmesh-official/acme.sh.git "$temp_dir" 2>/dev/null; then
             cd "$temp_dir" || true
             echo -e "${GRAY}   Running installer from git...${NC}"
-            install_output=$(./acme.sh --install -m "$random_email" 2>&1) || install_exit_code=$?
+            if [ -n "$acme_email" ]; then
+                install_output=$(./acme.sh --install -m "$acme_email" 2>&1) || install_exit_code=$?
+            else
+                install_output=$(./acme.sh --install 2>&1) || install_exit_code=$?
+            fi
             echo -e "${GRAY}   Git installer finished with code: $install_exit_code${NC}"
             [ "$DEBUG_MODE" = true ] && echo "DEBUG: Git install output: $install_output"
             cd - >/dev/null || true
@@ -840,6 +981,8 @@ issue_ssl_certificate() {
     
     log_info "Requesting SSL certificate for $domain..."
     
+    ACME_FATAL_ERROR=""
+    
     [ "$DEBUG_MODE" = true ] && echo "DEBUG: issue_ssl_certificate started"
     [ "$DEBUG_MODE" = true ] && echo "DEBUG: domain=$domain, ssl_dir=$ssl_dir, skip_reload=$skip_reload"
     
@@ -852,7 +995,7 @@ issue_ssl_certificate() {
     # Ensure acme.sh is installed
     if ! check_acme_installed; then
         [ "$DEBUG_MODE" = true ] && echo "DEBUG: acme.sh not installed, calling install_acme"
-        if ! install_acme; then
+        if ! install_acme "$domain"; then
             [ "$DEBUG_MODE" = true ] && echo "DEBUG: install_acme FAILED"
             [ "$DEBUG_MODE" = false ] && set -e
             [ "$DEBUG_MODE" = false ] && set -o pipefail 2>/dev/null || true
@@ -861,6 +1004,14 @@ issue_ssl_certificate() {
         [ "$DEBUG_MODE" = true ] && echo "DEBUG: install_acme completed successfully"
     else
         [ "$DEBUG_MODE" = true ] && echo "DEBUG: acme.sh already installed at $ACME_HOME"
+    fi
+    
+    # An account contact the CA refuses fails every port identically, so fix it
+    # before spending time on challenges
+    if ! ensure_valid_acme_account "$domain"; then
+        [ "$DEBUG_MODE" = false ] && set -e
+        [ "$DEBUG_MODE" = false ] && set -o pipefail 2>/dev/null || true
+        return 1
     fi
     
     [ "$DEBUG_MODE" = true ] && echo "DEBUG: Checking for socat"
@@ -1008,6 +1159,11 @@ issue_ssl_certificate() {
             log_error "Failed to issue certificate on port $try_port (exit code: $try_exit_code)"
             echo -e "${YELLOW}ACME output:${NC}"
             echo "$try_output" | tail -30
+            
+            # Account/contact rejections are not port problems
+            if echo "$try_output" | grep -qiE "invalidContact|invalidEmail|contact email has invalid domain|valid public suffix|Register account Error"; then
+                ACME_FATAL_ERROR="account"
+            fi
             return 1
         fi
     }
@@ -1017,6 +1173,18 @@ issue_ssl_certificate() {
         set -e
         set -o pipefail
         return 0
+    fi
+    
+    # A rejected ACME account fails identically on every port
+    if [ "$ACME_FATAL_ERROR" = "account" ]; then
+        echo
+        log_error "Let's Encrypt rejected the ACME account contact - this is not a port problem"
+        echo -e "${GRAY}Fix it manually and run the installation again:${NC}"
+        echo -e "${GRAY}   rm -rf $ACME_HOME/ca/acme-v02.api.letsencrypt.org${NC}"
+        echo -e "${GRAY}   $ACME_HOME/acme.sh --register-account -m <your-email>${NC}"
+        set -e
+        set -o pipefail
+        return 1
     fi
     
     # Try fallback ports if primary port wasn't explicitly set
@@ -4218,7 +4386,7 @@ renew_ssl_command() {
             fi
             
             # Install acme.sh and get certificate
-            if install_acme; then
+            if install_acme "$domain"; then
                 # Pre-check: verify ACME port is available
                 local acme_port_check="${ACME_PORT:-8443}"
                 log_info "Checking ACME port availability..."

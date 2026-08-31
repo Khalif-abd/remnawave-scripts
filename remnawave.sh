@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Remnawave Panel Installation Script
 # This script installs and manages Remnawave Panel
-# VERSION=6.6.1
+# VERSION=6.7.0
 
-SCRIPT_VERSION="6.6.1"
+SCRIPT_VERSION="6.7.0"
 BACKUP_SCRIPT_VERSION="1.5.0"  # Версия backup скрипта создаваемого Schedule функцией
 
 # Original invocation, captured before any shifting, so a self-update can
@@ -678,10 +678,11 @@ migrate_env_v588() {
 
     local needs_migration=false
 
-    # Check for SHORT_UUID_LENGTH (removed upstream)
-    if grep -q "^SHORT_UUID_LENGTH=" "$ENV_FILE" 2>/dev/null; then
-        needs_migration=true
-    fi
+    # NOTE: SHORT_UUID_LENGTH used to be deleted here as "removed upstream".
+    # It never was — it only vanished from .env.sample, while the backend kept
+    # reading it (config.schema.ts), and panel 3.4.0 documented it again next to
+    # the new SHORT_UUID_METHOD / SHORT_UUID_CUSTOM_PATTERN. Deleting it silently
+    # reset the operator's setting on every update, so it is left alone now.
 
     # Check for old Redis TCP config (should be socket now)
     if grep -q "^REDIS_HOST=" "$ENV_FILE" 2>/dev/null && ! grep -q "^REDIS_SOCKET=" "$ENV_FILE" 2>/dev/null; then
@@ -698,12 +699,6 @@ migrate_env_v588() {
     local backup_file="${ENV_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
     cp "$ENV_FILE" "$backup_file"
     echo -e "\033[1;32m✅ Backup created: $(basename "$backup_file")\033[0m"
-
-    # Remove SHORT_UUID_LENGTH
-    if grep -q "^SHORT_UUID_LENGTH=" "$ENV_FILE" 2>/dev/null; then
-        sed -i "/^SHORT_UUID_LENGTH=/d" "$ENV_FILE"
-        echo -e "\033[38;5;244m  ✓ Removed: SHORT_UUID_LENGTH (no longer used)\033[0m"
-    fi
 
     # Migrate Redis from TCP to Unix socket
     if grep -q "^REDIS_HOST=" "$ENV_FILE" 2>/dev/null && ! grep -q "^REDIS_SOCKET=" "$ENV_FILE" 2>/dev/null; then
@@ -741,11 +736,6 @@ REDIS_SOCKET=/var/run/valkey/valkey.sock\\
 check_env_v588_migration_needed() {
     if [ ! -f "$ENV_FILE" ]; then
         return 1
-    fi
-
-    # SHORT_UUID_LENGTH exists
-    if grep -q "^SHORT_UUID_LENGTH=" "$ENV_FILE" 2>/dev/null; then
-        return 0
     fi
 
     # Old Redis TCP config without socket
@@ -10505,6 +10495,223 @@ subpage_restart_command() {
 
 # ===== END SUBSCRIPTION PAGE MANAGEMENT =====
 
+# ---------------------------------------------------------------------------
+# Short UUID — the identifier that ends up in every subscription link
+#
+# Panel 3.4.0 turned the old SHORT_UUID_LENGTH knob into a small family:
+#   SHORT_UUID_METHOD=nanoid  → random string of SHORT_UUID_LENGTH chars (16..64)
+#   SHORT_UUID_METHOD=uuid    → standard UUID v4 (length ignored)
+#   SHORT_UUID_METHOD=custom  → SHORT_UUID_CUSTOM_PATTERN, e.g. {hex:16}-{digits:20}
+#
+# The setting only drives generation, so it affects users created from now on —
+# every existing shortUuid stays in the database and keeps working.
+#
+# The helpers below mirror the panel's own validation
+# (backend: src/common/utils/short-uuid/compile-short-uuid-pattern.util.ts) so a
+# bad pattern is rejected here instead of crashing the panel on the next start.
+# ---------------------------------------------------------------------------
+SHORT_UUID_ALPHABET='0123456789ABCDEFGHJKLMNPQRSTUVWXYZ_abcdefghjkmnopqrstuvwxyz-'
+
+# Alphabet behind each pattern token; unknown token → non-zero exit
+short_uuid_alphabet_for() {
+    case "$1" in
+        nanoid) printf '%s' "$SHORT_UUID_ALPHABET" ;;
+        alpha)  printf '%s' "$SHORT_UUID_ALPHABET" | tr -cd 'A-Za-z' ;;
+        digits) printf '%s' "$SHORT_UUID_ALPHABET" | tr -cd '0-9' ;;
+        hex)    printf '%s' "$SHORT_UUID_ALPHABET" | tr -cd '0-9a-f' ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Sample value only — $RANDOM is fine for a preview, nothing here is a secret
+short_uuid_random_string() {
+    local alphabet="$1" count="$2" out="" i size
+    size=${#alphabet}
+    for ((i = 0; i < count; i++)); do
+        out+="${alphabet:$((RANDOM % size)):1}"
+    done
+    printf '%s' "$out"
+}
+
+short_uuid_sample_uuid4() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr 'A-Z' 'a-z'
+    else
+        local hex
+        hex=$(openssl rand -hex 16 2>/dev/null || echo "0123456789abcdef0123456789abcdef")
+        printf '%s-%s-4%s-a%s-%s' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" "${hex:17:3}" "${hex:20:12}"
+    fi
+}
+
+# Entropy of one token in millibits (integer math: log2(alphabet) * size * 1000)
+short_uuid_entropy_mbits() {
+    awk -v a="$1" -v n="$2" 'BEGIN { printf "%d", n * log(a) / log(2) * 1000 }'
+}
+
+# Validates a SHORT_UUID_CUSTOM_PATTERN exactly like the panel does and prints a
+# sample value on success. Returns 1 with the reason on stderr otherwise.
+compile_short_uuid_pattern() {
+    local pattern="$1"
+    local rest="$pattern" sample="" literal token size alphabet
+    local length=0 entropy_mbits=0
+
+    if [ -z "$pattern" ]; then
+        echo "pattern must not be empty" >&2
+        return 1
+    fi
+
+    while [[ "$rest" =~ ^([^{]*)\{([a-z]+)(:([0-9]+))?\}(.*)$ ]]; do
+        literal="${BASH_REMATCH[1]}"
+        token="${BASH_REMATCH[2]}"
+        size="${BASH_REMATCH[4]}"
+        rest="${BASH_REMATCH[5]}"
+
+        if [ -n "$literal" ]; then
+            if [[ ! "$literal" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                echo "literal \"$literal\" may only use A-Z, a-z, 0-9, _ and -" >&2
+                return 1
+            fi
+            sample+="$literal"
+            length=$((length + ${#literal}))
+        fi
+
+        if [ "$token" = "uuid" ]; then
+            if [ -n "$size" ]; then
+                echo "\"{uuid}\" does not accept a length" >&2
+                return 1
+            fi
+            sample+="$(short_uuid_sample_uuid4)"
+            length=$((length + 36))
+            entropy_mbits=$((entropy_mbits + 122000))
+            continue
+        fi
+
+        if ! alphabet=$(short_uuid_alphabet_for "$token"); then
+            echo "unknown token \"{$token}\" — expected {nanoid:N}, {alpha:N}, {digits:N}, {hex:N} or {uuid}" >&2
+            return 1
+        fi
+
+        if [ -z "$size" ] || [ "$size" -lt 1 ] || [ "$size" -gt 64 ]; then
+            echo "\"{$token:N}\" must specify a length between 1 and 64" >&2
+            return 1
+        fi
+
+        sample+="$(short_uuid_random_string "$alphabet" "$size")"
+        length=$((length + size))
+        entropy_mbits=$((entropy_mbits + $(short_uuid_entropy_mbits "${#alphabet}" "$size")))
+    done
+
+    if [ -n "$rest" ]; then
+        if [[ ! "$rest" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "literal \"$rest\" may only use A-Z, a-z, 0-9, _ and -" >&2
+            return 1
+        fi
+        sample+="$rest"
+        length=$((length + ${#rest}))
+    fi
+
+    if [ "$length" -lt 16 ] || [ "$length" -gt 64 ]; then
+        echo "pattern produces $length characters, must be between 16 and 64" >&2
+        return 1
+    fi
+
+    if [ "$entropy_mbits" -lt 64000 ]; then
+        echo "pattern has only ~$((entropy_mbits / 1000)) bits of randomness, at least 64 are required" >&2
+        return 1
+    fi
+
+    printf '%s' "$sample"
+}
+
+# Asks how subscription links should be generated. Non-interactive runs (piped
+# stdin / CI) silently keep the upstream defaults.
+ask_short_uuid_settings() {
+    SHORT_UUID_METHOD="nanoid"
+    SHORT_UUID_LENGTH="16"
+    SHORT_UUID_CUSTOM_PATTERN=""
+
+    if [ ! -t 0 ]; then
+        return 0
+    fi
+
+    echo
+    colorized_echo white "🔗 Subscription link identifier (panel 3.4.0+)"
+    echo "   Controls how the shortUuid inside every subscription link is generated."
+    echo "   Applies to users created from now on — existing links are never touched."
+    echo
+    echo "   1) nanoid  — random string, 16..64 characters (default)"
+    echo "                e.g. $(short_uuid_random_string "$SHORT_UUID_ALPHABET" 16)"
+    echo "   2) uuid    — standard UUID v4, always 36 characters"
+    echo "                e.g. $(short_uuid_sample_uuid4)"
+    echo "   3) custom  — your own pattern, e.g. {hex:16}-{hex:16}-{digits:10}"
+    echo "                e.g. $(short_uuid_random_string "$(short_uuid_alphabet_for hex)" 16)-$(short_uuid_random_string "$(short_uuid_alphabet_for hex)" 16)-$(short_uuid_random_string "$(short_uuid_alphabet_for digits)" 10)"
+    echo
+    local choice
+    read -p "Choose [1-3, default 1]: " -r choice
+    choice="${choice:-1}"
+
+    case "$choice" in
+        2)
+            SHORT_UUID_METHOD="uuid"
+            colorized_echo green "✅ UUID v4 — e.g. $(short_uuid_sample_uuid4)"
+            return 0
+        ;;
+        3)
+            SHORT_UUID_METHOD="custom"
+        ;;
+        *)
+            SHORT_UUID_METHOD="nanoid"
+        ;;
+    esac
+
+    if [ "$SHORT_UUID_METHOD" = "nanoid" ]; then
+        local length
+        while true; do
+            read -p "Length of the random string [16-64, default 16]: " -r length
+            length="${length:-16}"
+            if [[ "$length" =~ ^[0-9]+$ ]] && [ "$length" -ge 16 ] && [ "$length" -le 64 ]; then
+                SHORT_UUID_LENGTH="$length"
+                colorized_echo green "✅ nanoid($length) — e.g. $(short_uuid_random_string "$SHORT_UUID_ALPHABET" "$length")"
+                return 0
+            fi
+            colorized_echo red "Length must be a number between 16 and 64"
+        done
+    fi
+
+    # custom
+    echo
+    colorized_echo white "   Pattern tokens:"
+    echo "     {nanoid:N}  N chars from 0-9 A-Z a-z _ - (look-alikes I O i l excluded)"
+    echo "     {alpha:N}   N letters      {digits:N}  N digits      {hex:N}  N hex chars"
+    echo "     {uuid}      a full UUID v4 (36 chars)"
+    echo "   Any other text is kept as-is (A-Z, a-z, 0-9, _ and - only)."
+    echo "   The result must be 16..64 characters with at least ~64 bits of randomness."
+    echo
+    colorized_echo gray "   Examples:  {hex:16}-{hex:16}-{digits:10}"
+    colorized_echo gray "              sub-{nanoid:20}"
+    colorized_echo gray "              {alpha:8}{digits:8}-{hex:12}"
+    echo
+    local pattern sample
+    while true; do
+        read -p "Pattern (empty = go back to nanoid/16): " -r pattern
+        if [ -z "$pattern" ]; then
+            SHORT_UUID_METHOD="nanoid"
+            SHORT_UUID_LENGTH="16"
+            SHORT_UUID_CUSTOM_PATTERN=""
+            colorized_echo gray "ℹ️  Using the default: nanoid(16)"
+            return 0
+        fi
+        if sample=$(compile_short_uuid_pattern "$pattern"); then
+            SHORT_UUID_CUSTOM_PATTERN="$pattern"
+            colorized_echo green "✅ Pattern accepted — e.g. $sample"
+            return 0
+        fi
+        colorized_echo red "❌ Invalid pattern, try again"
+    done
+}
+
 install_remnawave() {
     mkdir -p "$APP_DIR"
 
@@ -10744,6 +10951,16 @@ install_remnawave() {
     # Ask about PANEL_DOMAIN (optional)
     read -p "Enter PANEL_DOMAIN (optional, e.g., panel.example.com): " -r PANEL_DOMAIN
 
+    # How subscription link identifiers are generated (panel 3.4.0+)
+    ask_short_uuid_settings
+
+    # Written as an active line only for the custom method, otherwise the panel
+    # would refuse to start on an empty SHORT_UUID_CUSTOM_PATTERN.
+    SHORT_UUID_PATTERN_LINE="# SHORT_UUID_CUSTOM_PATTERN="
+    if [ "$SHORT_UUID_METHOD" = "custom" ] && [ -n "$SHORT_UUID_CUSTOM_PATTERN" ]; then
+        SHORT_UUID_PATTERN_LINE="SHORT_UUID_CUSTOM_PATTERN=$SHORT_UUID_CUSTOM_PATTERN"
+    fi
+
     # Determine image tag based on --dev flag.
     # Deliberately NOT pinned to a major: a pinned tag silently stops delivering
     # updates once the next major ships, and `update` would keep reporting
@@ -10866,6 +11083,23 @@ SERVICE_DISABLE_SRH_RECORDS=false
 EXPORT_TO_STREAM_ENABLED=false
 # Approximate max number of messages kept in the stream (MAXLEN ~). Oldest messages are trimmed when consumers lag behind.
 EXPORT_TO_STREAM_MAXLEN=3000
+
+### Short UUID (subscription link identifier, panel v3.4.0+) ###
+#   nanoid – random string of SHORT_UUID_LENGTH characters (default)
+#   uuid   – standard UUID v4 (SHORT_UUID_LENGTH is ignored)
+#   custom – user-defined pattern from SHORT_UUID_CUSTOM_PATTERN (SHORT_UUID_LENGTH is ignored)
+SHORT_UUID_METHOD=$SHORT_UUID_METHOD
+# Only used when SHORT_UUID_METHOD=nanoid. Must be between 16 and 64.
+SHORT_UUID_LENGTH=$SHORT_UUID_LENGTH
+# Only used (and required) when SHORT_UUID_METHOD=custom.
+# Tokens: {nanoid:N}, {alpha:N}, {digits:N}, {hex:N}, {uuid}. Any other text is used as-is.
+# Tokens generate characters from the same alphabet the nanoid method uses:
+# 0123456789ABCDEFGHJKLMNPQRSTUVWXYZ_abcdefghjkmnopqrstuvwxyz- (look-alikes I, O, i, l excluded).
+# Literal text may use any latin letter or digit, and of the special characters only _ and -.
+# The pattern must produce between 16 and 64 characters and contain at least ~64 bits of randomness
+# (e.g. {nanoid:16}, {hex:16} or {digits:20}).
+# Example: SHORT_UUID_CUSTOM_PATTERN={hex:16}-{hex:16}-{digits:10}
+$SHORT_UUID_PATTERN_LINE
 
 ### Database ###
 ### For Postgres Docker container ###
@@ -14054,7 +14288,7 @@ update_command() {
         has_telegram_quotes_migration=true
     fi
 
-    # Проверяем необходимость миграции v5.8.8 (Redis socket, SHORT_UUID_LENGTH)
+    # Проверяем необходимость миграции v5.8.8 (Redis socket)
     local has_env_v588_migration=false
     if check_env_v588_migration_needed; then
         has_env_v588_migration=true
@@ -14216,7 +14450,7 @@ update_command() {
         migrate_telegram_notify_quotes
         env_migrated=true
     fi
-    # v5.8.8 .env migration (Redis socket, SHORT_UUID_LENGTH)
+    # v5.8.8 .env migration (Redis socket)
     if check_env_v588_migration_needed; then
         migrate_env_v588
         env_migrated=true

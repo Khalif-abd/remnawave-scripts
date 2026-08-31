@@ -4,9 +4,9 @@
 
 [![Лицензия MIT](https://img.shields.io/badge/Лицензия-MIT-yellow.svg)](./LICENSE)
 [![Shell](https://img.shields.io/badge/Язык-Bash-blue.svg)](#)
-[![remnawave.sh](https://img.shields.io/badge/remnawave.sh-6.6.1-blue.svg)](#-remnawave-panel)
-[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.5.1-blue.svg)](#-remnanode)
-[![Panel](https://img.shields.io/badge/Remnawave_Panel-3.3.0_ready-brightgreen.svg)](#)
+[![remnawave.sh](https://img.shields.io/badge/remnawave.sh-6.7.0-blue.svg)](#-remnawave-panel)
+[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.6.0-blue.svg)](#-remnanode)
+[![Panel](https://img.shields.io/badge/Remnawave_Panel-3.4.x_ready-brightgreen.svg)](#)
 [![Локализация](https://img.shields.io/badge/🌐-RU_|_EN-green.svg)](./README.md)
 
 **[English](./README.md)** · **[Быстрый старт](#-быстрый-старт)** · **[Скрипты](#-скрипты)** · **[Бэкапы](#-бэкапы-и-миграция)** · **[Поддержка](https://gig.ovh/t/remnawave-managment-scripts-by-dignezzz/116)**
@@ -15,13 +15,14 @@
 
 Однострочная установка и полноценный CLI для **Remnawave Panel**, **RemnaNode**, маскировки **Reality**, **WARP/Tor** и корпоративных бэкапов. Всё на Docker, интерфейс RU/EN, идемпотентные операции, автообновление.
 
-> 🆕 **Remnawave Panel 3.3.0 и node 3.3.0 поддерживаются из коробки.** Свежие установки сразу
-> получают актуальную конфигурацию, а `remnawave update` сам мигрирует старый `.env` — с проверкой
+> 🆕 **Remnawave Panel 3.4.x и node 3.4.x поддерживаются из коробки.** Свежие установки сразу
+> получают актуальную конфигурацию — включая новый выбор `SHORT_UUID_METHOD` для ссылок подписки
+> (`nanoid` / `uuid` / свой шаблон), — а `remnawave update` сам мигрирует старый `.env` с проверкой
 > версии образа и бэкапом каждого изменённого файла.
 >
-> ⚠️ **Нода 3.3.0+ работает только с панелью 3.3.0+** (нода теперь требует производный SNI в
-> TLS-handshake). `remnanode` спрашивает об этом один раз; если панель ещё на 3.2.x — ставьте с
-> `--tag 3.2.2`.
+> ⚠️ **Панель 3.3.0+ нужна только линейке нод 3.3.0 … 3.3.2** (эти релизы требуют производный SNI
+> в TLS-handshake). В ноде 3.4.0 проверку сделали опциональной (`SNI_VERIFICATION`, по умолчанию
+> выключена), поэтому свежая нода снова работает и со старой панелью.
 
 ## ⚡ Быстрый старт
 
@@ -55,8 +56,8 @@ sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remn
 
 | Скрипт | Версия | Что делает | Документация |
 |---|---|---|---|
-| 🚀 **remnawave.sh** | `6.6.1` | Панель: установка, Caddy, бэкапы, subscription-page | этот файл |
-| 🛰 **remnanode.sh** | `4.5.1` | Нода: Xray-core, логи, автоперезапуск | этот файл |
+| 🚀 **remnawave.sh** | `6.7.0` | Панель: установка, Caddy, бэкапы, subscription-page | этот файл |
+| 🛰 **remnanode.sh** | `4.6.0` | Нода: Xray-core, логи, автоперезапуск | этот файл |
 | 🎭 **selfsteal.sh** | `2.10.1` | Caddy-маскировка для Reality, 11 шаблонов сайтов | [README-selfsteal](./README-selfsteal.md) |
 | 🌐 **wtm.sh** | `1.5.2` | WARP + Tor: WireGuard-outbound для Xray, WARP+ | [README-warp](./README-warp.md) |
 | 🐦 **netbird.sh** | `1.4.2` | NetBird mesh-VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
@@ -73,6 +74,7 @@ sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remn
 <div align="center"><img src="assets/preview-remnawave.svg" alt="Меню remnawave" width="640"></div>
 
 - **Установка под ключ** — `.env`, секреты, порты, compose и админ создаются автоматически (креды в `admin-credentials.txt`)
+- **Формат ссылки подписки** — при установке выбирается `nanoid` (16..64 символов), `uuid` или свой шаблон; шаблон проверяется ровно так же, как это делает панель, и сразу показывается пример (панель 3.4.0+)
 - **Caddy reverse proxy** — авто-SSL, опционально портал аутентификации с MFA (Caddy Security)
 - **Subscription-page** — вместе с панелью или standalone на отдельном сервере; API-токен создаётся сам, с минимальными скоупами
 - **Безопасный `update`** — снапшот БД и конфигов перед обновлением + автоматические миграции (включая v2 → v3)
@@ -154,12 +156,14 @@ remnanode xray_log_err    # ошибки Xray в реальном времени
 | `--port=PORT` / `--xtls-port=PORT` | NODE_PORT (3000) / устаревший XTLS_API_PORT (61000, игнорируется нодой 2.8.0+) |
 | `--xray` / `--no-xray` | Ставить ли Xray-core |
 | `--name NAME` / `--dev` | Имя каталога / dev-образ |
-| `--tag VERSION` | Запинить версию образа ноды, например `--tag 3.2.2`. Только точные версии: плавающих тегов `2`/`3` у ноды нет. Запиненная нода не двигается при `update`; `update --tag VERSION` перепинивает уже установленную ноду |
+| `--tag VERSION` | Запинить версию образа ноды, например `--tag 3.4.1`. Только точные версии: плавающих тегов `2`/`3` у ноды нет. Запиненная нода не двигается при `update`; `update --tag VERSION` перепинивает уже установленную ноду |
 
-> ⚠️ **Нода 3.3.0+ работает только с панелью 3.3.0+.** Начиная с 3.3.0 нода отклоняет TLS-handshake,
-> если панель не предъявляет производный SNI, — поэтому новая нода на старой панели просто числится
-> офлайн (`unknown sni` в логах ноды). Панель ещё на 3.2.x? Ставьте/обновляйте с `--tag 3.2.2`.
-> Установщик спрашивает об этом один раз и запоминает ответ.
+> ⚠️ **Панель 3.3.0+ обязательна только для нод 3.3.0 … 3.3.2.** Эти релизы отклоняют
+> TLS-handshake, если панель не предъявляет производный SNI, — такая нода на старой панели просто
+> числится офлайн (`unknown sni` в логах ноды). Установщик спрашивает об этом один раз и только
+> когда запрошенный тег попадает в это окно. С ноды 3.4.0 проверка спрятана за `SNI_VERIFICATION`
+> (по умолчанию выключена), поэтому `latest` работает с любой панелью; включить проверку обратно
+> можно строкой `SNI_VERIFICATION=true` в `.env` ноды, если панель на 3.3.0 или новее.
 >
 > `up` / `restart` никогда не меняют запущенный образ — это делает только `update`. А вот сам CLI
 > обновляется автоматически (через зеркала jsDelivr, если GitHub недоступен).

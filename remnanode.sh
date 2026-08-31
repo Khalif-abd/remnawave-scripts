@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Version: 4.5.1
+# Version: 4.6.0
 set -e
-SCRIPT_VERSION="4.5.1"
+SCRIPT_VERSION="4.6.0"
 
 # Original invocation, captured before any shifting, so a self-update can
 # re-exec the new script with exactly the command the user typed.
@@ -183,7 +183,7 @@ while [[ $# -gt 0 ]]; do
                     NODE_IMAGE_TAG="$2"
                     shift 2
                 else
-                    echo "Error: --tag requires a value (e.g. --tag 3.2.2)."
+                    echo "Error: --tag requires a value (e.g. --tag 3.4.1)."
                     exit 1
                 fi
             else
@@ -195,7 +195,7 @@ while [[ $# -gt 0 ]]; do
             if [[ "$COMMAND" == "install" || "$COMMAND" == "update" ]]; then
                 NODE_IMAGE_TAG="${1#*=}"
                 if [ -z "$NODE_IMAGE_TAG" ]; then
-                    echo "Error: --tag requires a value (e.g. --tag=3.2.2)."
+                    echo "Error: --tag requires a value (e.g. --tag=3.4.1)."
                     exit 1
                 fi
                 shift
@@ -328,17 +328,21 @@ GEOSITE_FILE="$DATA_DIR/geosite.dat"
 DEFAULT_XTLS_API_PORT=61000
 
 # --- Node <-> panel version coupling -----------------------------------------
-# Since remnawave/node 3.3.0 the node's HTTPS listener installs an SNICallback
-# that rejects every TLS handshake whose SNI != deriveSni(caCert, jwtPublicKey)
-# (node: src/main.ts -> makeSniVerifier, plus requestCert/rejectUnauthorized).
-# The matching client-side helper exists in the panel only from backend 3.3.0 on
+# node 3.3.0 .. 3.3.2 install an SNICallback that rejects every TLS handshake
+# whose SNI != deriveSni(caCert, jwtPublicKey) (node: src/main.ts ->
+# makeSniVerifier, plus requestCert/rejectUnauthorized). The matching
+# client-side helper exists in the panel only from backend 3.3.0 on
 # (src/common/utils/certs/generate-servername.util.ts, used by axios.service.ts).
 #
-#   node >= 3.3.0  +  panel <  3.3.0  ->  every request dies with "unknown sni"
+#   node 3.3.x     +  panel <  3.3.0  ->  every request dies with "unknown sni"
 #   node <  3.3.0  +  panel >= 3.3.0  ->  fine (old node ignores the servername)
 #
-# So a node may only be moved onto the 3.3.0 line once the panel is there too.
-NODE_SNI_MIN_VERSION="3.3.0"
+# node 3.4.0 put that whole path behind a new SNI_VERIFICATION env var which
+# defaults to "false" (node commit 84a79955), so from 3.4.0 on the listener is
+# back to the plain key/cert/ca of the 3.2.x line and talks to any panel again.
+# The gate below therefore only covers the 3.3.x window.
+NODE_SNI_MIN_VERSION="3.3.0"    # first node release that enforces the derived SNI
+NODE_SNI_OPTIONAL_VERSION="3.4.0"  # first node release where it is opt-in (off by default)
 PANEL_COMPAT_ACK_FILE="$APP_DIR/.panel-compat-ack"
 
 # Deprecated ports (removed in v2.5.0+ of remnawave/node)
@@ -1135,13 +1139,14 @@ ensure_latest_script() {
     exec "$target_path" "${SCRIPT_ORIGINAL_ARGS[@]}"
 }
 
-# True when the requested tag lands on (or past) the SNI-gated node line.
-# Floating tags (latest / dev) always do, because the newest release is 3.3.0+.
+# True when the requested tag lands inside the SNI-gated node window
+# (>= 3.3.0 and < 3.4.0). Floating tags (latest / dev) resolve to the newest
+# release, which is past that window and ships SNI_VERIFICATION=false.
 node_tag_needs_sni_panel() {
     local tag="$1"
 
     case "$tag" in
-        latest|dev|"") return 0 ;;
+        latest|dev|"") return 1 ;;
     esac
 
     # Strip a leading "v" and anything after the patch (e.g. 3.3.0-rc1)
@@ -1149,16 +1154,21 @@ node_tag_needs_sni_panel() {
     ver="${ver%%-*}"
 
     if [[ "$ver" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
-        version_gte "$ver" "$NODE_SNI_MIN_VERSION" && return 0
-        return 1
+        # Pad to major.minor.patch so "3.4" is not sorted below "3.4.0"
+        while [ "$(printf '%s' "$ver" | tr -cd '.' | wc -c)" -lt 2 ]; do
+            ver="${ver}.0"
+        done
+        version_gte "$ver" "$NODE_SNI_MIN_VERSION" || return 1
+        version_gte "$ver" "$NODE_SNI_OPTIONAL_VERSION" && return 1
+        return 0
     fi
 
-    # Unrecognised tag → assume it may be new
-    return 0
+    # Unrecognised tag → nothing points at the narrow 3.3.x window, don't nag
+    return 1
 }
 
 # One-time confirmation that the panel is already on 3.3.0+ before moving the
-# node onto the SNI-gated line. Once acknowledged we never ask again.
+# node onto the SNI-gated 3.3.x line. Once acknowledged we never ask again.
 # Returns 0 to proceed, 1 to abort.
 confirm_panel_supports_sni() {
     local tag="$1"
@@ -1168,13 +1178,13 @@ confirm_panel_supports_sni() {
     [ -f "$PANEL_COMPAT_ACK_FILE" ] && return 0
 
     if [ "$FORCE_MODE" == "true" ]; then
-        colorized_echo yellow "⚠️  node >= $NODE_SNI_MIN_VERSION requires Remnawave panel >= $NODE_SNI_MIN_VERSION (--force: not asking)"
+        colorized_echo yellow "⚠️  node 3.3.x requires Remnawave panel >= $NODE_SNI_MIN_VERSION (--force: not asking)"
         mark_panel_compat_ack
         return 0
     fi
 
     if [ ! -t 0 ]; then
-        colorized_echo yellow "⚠️  node >= $NODE_SNI_MIN_VERSION requires Remnawave panel >= $NODE_SNI_MIN_VERSION (non-interactive: not asking)"
+        colorized_echo yellow "⚠️  node 3.3.x requires Remnawave panel >= $NODE_SNI_MIN_VERSION (non-interactive: not asking)"
         mark_panel_compat_ack
         return 0
     fi
@@ -1183,21 +1193,23 @@ confirm_panel_supports_sni() {
     colorized_echo yellow "==================================================="
     colorized_echo yellow "⚠️  Panel version requirement"
     colorized_echo yellow "==================================================="
-    colorized_echo white  "   remnawave/node $NODE_SNI_MIN_VERSION+ only accepts connections from a"
+    colorized_echo white  "   The node line 3.3.0 .. 3.3.2 only accepts connections from a"
     colorized_echo white  "   panel running $NODE_SNI_MIN_VERSION or newer."
     echo
-    colorized_echo gray   "   Since $NODE_SNI_MIN_VERSION the node rejects the TLS handshake unless the"
-    colorized_echo gray   "   panel presents a derived SNI. On an older panel the node will"
-    colorized_echo gray   "   simply show up as offline ('unknown sni' in the node logs)."
+    colorized_echo gray   "   Those releases reject the TLS handshake unless the panel presents"
+    colorized_echo gray   "   a derived SNI. On an older panel the node will simply show up as"
+    colorized_echo gray   "   offline ('unknown sni' in the node logs)."
     echo
-    colorized_echo gray   "   Older panel? Pin the matching node line instead:"
+    colorized_echo gray   "   node $NODE_SNI_OPTIONAL_VERSION+ made that check opt-in (SNI_VERIFICATION, off by"
+    colorized_echo gray   "   default), so on an older panel take a tag outside the 3.3.x window:"
+    colorized_echo green  "      sudo $APP_NAME $context            # latest (3.4+, no SNI gate)"
     colorized_echo green  "      sudo $APP_NAME $context --tag 3.2.2"
     echo
     read -p "   Is your panel already on $NODE_SNI_MIN_VERSION or newer? [y/N]: " -r panel_ok
     echo
 
     if [[ ! "$panel_ok" =~ ^[Yy]$ ]]; then
-        colorized_echo red "❌ Cancelled — upgrade the panel first, or re-run with --tag 3.2.2"
+        colorized_echo red "❌ Cancelled — upgrade the panel first, or pick a tag outside 3.3.x"
         return 1
     fi
 
@@ -1212,7 +1224,8 @@ mark_panel_compat_ack() {
     {
         echo "# The Remnawave panel is on $NODE_SNI_MIN_VERSION+ (operator-confirmed, or"
         echo "# accepted implicitly via --force / a non-interactive run)."
-        echo "# node $NODE_SNI_MIN_VERSION+ enforces a derived-SNI TLS handshake."
+        echo "# node 3.3.0 .. 3.3.2 enforce a derived-SNI TLS handshake; from"
+        echo "# $NODE_SNI_OPTIONAL_VERSION on it is opt-in via SNI_VERIFICATION (default false)."
         echo "acknowledged_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     } > "$PANEL_COMPAT_ACK_FILE" 2>/dev/null || true
 }
@@ -1404,6 +1417,11 @@ SECRET_KEY=$SECRET_KEY_VALUE
 ### Legacy: removed from the node config schema in 2.8.0 (replaced by an
 ### internally generated XTLS_API_SOCKET_PATH). Kept for installs pinned to <= 2.7.x.
 XTLS_API_PORT=$XTLS_API_PORT
+
+### node 3.4.0+: verify that the panel presents the derived SNI on every TLS
+### handshake. Off by default upstream; turn it on only when the panel is on
+### 3.3.0 or newer, otherwise the node stops accepting connections.
+#SNI_VERIFICATION=true
 EOL
     colorized_echo green "Environment file saved in $ENV_FILE"
 
@@ -1430,7 +1448,7 @@ EOL
         colorized_echo green "✅ Pinned node image: ${IMAGE_REGISTRY}:${IMAGE_TAG}"
     fi
 
-    # node 3.3.0+ only talks to panel 3.3.0+ (derived-SNI TLS gate) — confirm once
+    # node 3.3.x only talks to panel 3.3.0+ (derived-SNI TLS gate) — confirm once
     if ! confirm_panel_supports_sni "$IMAGE_TAG" "install"; then
         exit 1
     fi
@@ -1617,8 +1635,8 @@ up_remnanode() {
 
     # `up` and `restart` are lifecycle commands, not upgrades. Pulling here would
     # silently move anyone on a floating tag onto a newer node release just for
-    # restarting a container — including onto 3.3.0+, which stops talking to a
-    # panel below 3.3.0. Whoever wants a new image runs `update`.
+    # restarting a container — a release that may need a newer panel (as 3.3.x
+    # did with its derived-SNI gate). Whoever wants a new image runs `update`.
     #
     # The one exception is a first start with nothing in the local image store:
     # there is no version to preserve, and pulling explicitly keeps the retry
@@ -2976,7 +2994,7 @@ update_command() {
     fi
 
     # `update --tag X` re-pins the compose image. This is the escape hatch out of
-    # the SNI-gated 3.3.0 line for anyone still on panel 3.2.x.
+    # the SNI-gated 3.3.x line for anyone still on panel 3.2.x.
     #
     # The target tag is what the node will actually run, so it — not the tag
     # currently in the file — is what the panel-compat gate has to judge. The
@@ -2993,7 +3011,7 @@ update_command() {
         echo -e "\033[38;5;250m🏷️  Requested tag:\033[0m \033[38;5;15m$requested_tag\033[0m"
     fi
 
-    # node 3.3.0+ only talks to panel 3.3.0+ (derived-SNI TLS gate) — confirm once,
+    # node 3.3.x only talks to panel 3.3.0+ (derived-SNI TLS gate) — confirm once,
     # BEFORE anything is pulled or rewritten, so a wrong answer costs nothing.
     if ! confirm_panel_supports_sni "$requested_tag" "update"; then
         exit 0
@@ -4549,10 +4567,10 @@ usage() {
     echo
 
     echo -e "\033[1;33m⚠️  Panel version requirement:\033[0m"
-    echo -e "\033[38;5;244m      remnawave/node 3.3.0+ only accepts connections from a panel on\033[0m"
-    echo -e "\033[38;5;244m      3.3.0 or newer (the node enforces a derived-SNI TLS handshake).\033[0m"
-    echo -e "\033[38;5;244m      Still on panel 3.2.x?  $APP_NAME install --tag 3.2.2\033[0m"
-    echo -e "\033[38;5;244m                             $APP_NAME update  --tag 3.2.2\033[0m"
+    echo -e "\033[38;5;244m      Only the node line 3.3.0 .. 3.3.2 requires a panel on 3.3.0+\033[0m"
+    echo -e "\033[38;5;244m      (those releases enforce a derived-SNI TLS handshake). Since node\033[0m"
+    echo -e "\033[38;5;244m      3.4.0 the check is opt-in (SNI_VERIFICATION, off by default), so\033[0m"
+    echo -e "\033[38;5;244m      the latest node works with an older panel again.\033[0m"
     echo
 
     echo -e "\033[1;37m🎯 Install Options:\033[0m"
@@ -4564,7 +4582,7 @@ usage() {
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--no-xray" "Skip Xray-core (default in force mode)"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--name NAME" "Custom installation name"
     printf "   \033[38;5;244m%-18s\033[0m %s\n" "--dev" "Use development image"
-    printf "   \033[38;5;244m%-18s\033[0m %s\n" "--tag TAG" "Pin node image version (e.g. 3.2.2)"
+    printf "   \033[38;5;244m%-18s\033[0m %s\n" "--tag TAG" "Pin node image version (e.g. 3.4.1)"
     echo
     echo -e "\033[38;5;244m   💡 --tag keeps the node on an older release for panels that are not\033[0m"
     echo -e "\033[38;5;244m      updated yet. Use an EXACT version — remnawave/node publishes only\033[0m"

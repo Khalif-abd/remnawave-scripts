@@ -4,9 +4,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Shell](https://img.shields.io/badge/language-Bash-blue.svg)](#)
-[![remnawave.sh](https://img.shields.io/badge/remnawave.sh-6.6.1-blue.svg)](#-remnawave-panel)
-[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.5.1-blue.svg)](#-remnanode)
-[![Panel](https://img.shields.io/badge/Remnawave_Panel-3.3.0_ready-brightgreen.svg)](#)
+[![remnawave.sh](https://img.shields.io/badge/remnawave.sh-6.7.0-blue.svg)](#-remnawave-panel)
+[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.6.0-blue.svg)](#-remnanode)
+[![Panel](https://img.shields.io/badge/Remnawave_Panel-3.4.x_ready-brightgreen.svg)](#)
 [![Localization](https://img.shields.io/badge/🌐-EN_|_RU-green.svg)](./README_RU.md)
 
 **[Русский](./README_RU.md)** · **[Quick Start](#-quick-start)** · **[Scripts](#-scripts)** · **[Backups](#-backups--migration)** · **[Support](https://gig.ovh/t/remnawave-managment-scripts-by-dignezzz/116)**
@@ -15,12 +15,14 @@
 
 One-liner installs and a full-featured CLI for **Remnawave Panel**, **RemnaNode**, **Reality masking**, **WARP/Tor**, and enterprise-grade backups. Docker-based, bilingual UI (EN/RU), idempotent operations, self-updates.
 
-> 🆕 **Remnawave Panel 3.3.0 and node 3.3.0 supported out of the box.** Fresh installs get the
-> current config right away, and `remnawave update` migrates an older `.env` automatically — with
-> target image version checking and a backup of every file it touches.
+> 🆕 **Remnawave Panel 3.4.x and node 3.4.x supported out of the box.** Fresh installs get the
+> current config right away — including the new `SHORT_UUID_METHOD` picker for subscription links
+> (`nanoid` / `uuid` / custom pattern) — and `remnawave update` migrates an older `.env`
+> automatically, with target image version checking and a backup of every file it touches.
 >
-> ⚠️ **node 3.3.0+ only talks to panel 3.3.0+** (the node now enforces a derived-SNI TLS handshake).
-> `remnanode` asks about this once; if your panel is still on 3.2.x, use `--tag 3.2.2`.
+> ⚠️ **Only the node line 3.3.0 … 3.3.2 requires panel 3.3.0+** (those releases enforce a
+> derived-SNI TLS handshake). Node 3.4.0 made that check opt-in (`SNI_VERIFICATION`, off by
+> default), so the latest node works with an older panel again.
 
 ## ⚡ Quick Start
 
@@ -54,8 +56,8 @@ After installation each script is a global command: `remnawave`, `remnanode`, `s
 
 | Script | Version | Purpose | Docs |
 |---|---|---|---|
-| 🚀 **remnawave.sh** | `6.6.1` | Panel: install, Caddy, backups, subscription-page | this file |
-| 🛰 **remnanode.sh** | `4.5.1` | Node: Xray-core, logs, auto-restart | this file |
+| 🚀 **remnawave.sh** | `6.7.0` | Panel: install, Caddy, backups, subscription-page | this file |
+| 🛰 **remnanode.sh** | `4.6.0` | Node: Xray-core, logs, auto-restart | this file |
 | 🎭 **selfsteal.sh** | `2.10.1` | Caddy masking for Reality, 11 website templates | [README-selfsteal](./README-selfsteal.md) |
 | 🌐 **wtm.sh** | `1.5.2` | WARP + Tor: WireGuard outbound for Xray, WARP+ | [README-warp](./README-warp.md) |
 | 🐦 **netbird.sh** | `1.4.2` | NetBird mesh VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
@@ -72,6 +74,7 @@ first, then jsDelivr mirrors. To install or refresh just the CLI on a server, us
 <div align="center"><img src="assets/preview-remnawave.svg" alt="remnawave menu" width="640"></div>
 
 - **Turnkey install** — `.env`, secrets, ports, compose, and the admin account are generated automatically (credentials in `admin-credentials.txt`)
+- **Subscription link format** — pick `nanoid` (16..64 chars), `uuid` or your own pattern at install time; the pattern is validated exactly like the panel does, with a live sample (panel 3.4.0+)
 - **Caddy reverse proxy** — auto-SSL, optional authentication portal with MFA (Caddy Security)
 - **Subscription-page** — alongside the panel or standalone on a separate server; API token created automatically with least-privilege scopes
 - **Safe `update`** — DB + config snapshot before every update, plus automatic migrations (including v2 → v3)
@@ -153,12 +156,14 @@ remnanode xray_log_err    # real-time Xray errors
 | `--port=PORT` / `--xtls-port=PORT` | NODE_PORT (3000) / legacy XTLS_API_PORT (61000, ignored by node 2.8.0+) |
 | `--xray` / `--no-xray` | Whether to install Xray-core |
 | `--name NAME` / `--dev` | Directory name / dev image |
-| `--tag VERSION` | Pin the node image, e.g. `--tag 3.2.2`. Exact versions only: the node has no floating `2`/`3` tags. A pinned node is not moved by `update`; `update --tag VERSION` re-pins an existing install |
+| `--tag VERSION` | Pin the node image, e.g. `--tag 3.4.1`. Exact versions only: the node has no floating `2`/`3` tags. A pinned node is not moved by `update`; `update --tag VERSION` re-pins an existing install |
 
-> ⚠️ **Node 3.3.0+ requires panel 3.3.0+.** Since 3.3.0 the node rejects the TLS handshake unless the
-> panel presents a derived SNI, so a newer node on an older panel just shows up as offline
-> (`unknown sni` in the node logs). Still on panel 3.2.x? Install or update with `--tag 3.2.2`.
-> The installer asks about this once and remembers the answer.
+> ⚠️ **Only node 3.3.0 … 3.3.2 require panel 3.3.0+.** Those releases reject the TLS handshake
+> unless the panel presents a derived SNI, so such a node on an older panel just shows up as offline
+> (`unknown sni` in the node logs). The installer asks about this once, and only when the requested
+> tag falls inside that window. Node 3.4.0+ hides the check behind `SNI_VERIFICATION` (off by
+> default), so `latest` runs fine on any panel; set `SNI_VERIFICATION=true` in the node `.env` to
+> turn it back on when your panel is 3.3.0 or newer.
 >
 > `up` / `restart` never change the running image — only `update` does. The CLI itself, on the other
 > hand, keeps itself current automatically (mirrored via jsDelivr when GitHub is unreachable).

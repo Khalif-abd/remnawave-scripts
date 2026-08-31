@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Remnawave Panel Installation Script
 # This script installs and manages Remnawave Panel
-# VERSION=6.7.0
+# VERSION=6.7.1
 
-SCRIPT_VERSION="6.7.0"
+SCRIPT_VERSION="6.7.1"
 BACKUP_SCRIPT_VERSION="1.5.0"  # Версия backup скрипта создаваемого Schedule функцией
 
 # Original invocation, captured before any shifting, so a self-update can
@@ -731,6 +731,103 @@ REDIS_SOCKET=/var/run/valkey/valkey.sock\\
     fi
 
     echo -e "\033[1;32m🎉 v5.8.8 migration completed!\033[0m"
+}
+
+# Panel 3.4.0 documented the short-uuid family in .env.sample. The variables all
+# have defaults in the panel's schema, so an .env without them keeps working —
+# but then the block is invisible to the operator, so `update` writes it once.
+check_short_uuid_env_migration_needed() {
+    if [ ! -f "$ENV_FILE" ]; then
+        return 1
+    fi
+
+    grep -q "^SHORT_UUID_METHOD=" "$ENV_FILE" 2>/dev/null && return 1
+    return 0
+}
+
+migrate_env_short_uuid() {
+    if [ ! -f "$ENV_FILE" ]; then
+        return 0
+    fi
+
+    # An operator who set SHORT_UUID_LENGTH by hand keeps that length
+    local existing_length
+    existing_length=$(grep -E "^SHORT_UUID_LENGTH=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"' " )
+    if ! [[ "$existing_length" =~ ^[0-9]+$ ]] || [ "$existing_length" -lt 16 ] || [ "$existing_length" -gt 64 ]; then
+        existing_length=16
+    fi
+
+    SHORT_UUID_METHOD="nanoid"
+    SHORT_UUID_LENGTH="$existing_length"
+    SHORT_UUID_CUSTOM_PATTERN=""
+
+    echo
+    echo -e "\033[1;36m🔗 Adding the panel 3.4.0 subscription-link settings to .env\033[0m"
+
+    if [ -t 0 ]; then
+        local configure_now
+        read -p "Choose the subscription link format now? (y/N): " -r configure_now
+        if [[ $configure_now =~ ^[Yy]$ ]]; then
+            ask_short_uuid_settings "$existing_length"
+        else
+            echo -e "\033[38;5;244m  Keeping nanoid/${existing_length} — change it later with '\''$APP_NAME edit-env'\''\033[0m"
+        fi
+    fi
+
+    local backup_file="${ENV_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$ENV_FILE" "$backup_file"
+    echo -e "\033[1;32m✅ Backup created: $(basename "$backup_file")\033[0m"
+
+    # The new block carries every SHORT_UUID_* line, so drop the old ones first
+    sed -i "/^SHORT_UUID_METHOD=/d;/^SHORT_UUID_LENGTH=/d;/^SHORT_UUID_CUSTOM_PATTERN=/d" "$ENV_FILE"
+
+    local pattern_line="# SHORT_UUID_CUSTOM_PATTERN="
+    if [ "$SHORT_UUID_METHOD" = "custom" ] && [ -n "$SHORT_UUID_CUSTOM_PATTERN" ]; then
+        pattern_line="SHORT_UUID_CUSTOM_PATTERN=$SHORT_UUID_CUSTOM_PATTERN"
+    fi
+
+    local block_file
+    block_file=$(mktemp)
+    cat > "$block_file" <<EOL
+
+### Short UUID (subscription link identifier, panel v3.4.0+) ###
+#   nanoid – random string of SHORT_UUID_LENGTH characters (default)
+#   uuid   – standard UUID v4 (SHORT_UUID_LENGTH is ignored)
+#   custom – user-defined pattern from SHORT_UUID_CUSTOM_PATTERN (SHORT_UUID_LENGTH is ignored)
+SHORT_UUID_METHOD=$SHORT_UUID_METHOD
+# Only used when SHORT_UUID_METHOD=nanoid. Must be between 16 and 64.
+SHORT_UUID_LENGTH=$SHORT_UUID_LENGTH
+# Only used (and required) when SHORT_UUID_METHOD=custom.
+# Tokens: {nanoid:N}, {alpha:N}, {digits:N}, {hex:N}, {uuid}. Any other text is used as-is.
+# The pattern must produce between 16 and 64 characters and contain at least ~64 bits of randomness.
+# Example: SHORT_UUID_CUSTOM_PATTERN={hex:16}-{hex:16}-{digits:10}
+$pattern_line
+
+EOL
+
+    # Same position as upstream .env.sample: right before the Database section.
+    # Written back with "cat >" so the file keeps its inode, owner and mode.
+    local tmp_file
+    tmp_file=$(mktemp)
+    if grep -q "^### Database ###" "$ENV_FILE" 2>/dev/null; then
+        awk -v block="$block_file" '
+            /^### Database ###/ && !inserted {
+                while ((getline line < block) > 0) print line
+                close(block)
+                inserted = 1
+            }
+            { print }
+        ' "$ENV_FILE" > "$tmp_file" && cat "$tmp_file" > "$ENV_FILE"
+    else
+        cat "$ENV_FILE" "$block_file" > "$tmp_file" && cat "$tmp_file" > "$ENV_FILE"
+    fi
+    rm -f "$tmp_file" "$block_file"
+
+    if [ "$SHORT_UUID_METHOD" = "custom" ]; then
+        echo -e "\033[38;5;244m  ✓ Added: SHORT_UUID_METHOD=custom ($SHORT_UUID_CUSTOM_PATTERN)\033[0m"
+    else
+        echo -e "\033[38;5;244m  ✓ Added: SHORT_UUID_METHOD=$SHORT_UUID_METHOD, SHORT_UUID_LENGTH=$SHORT_UUID_LENGTH\033[0m"
+    fi
 }
 
 check_env_v588_migration_needed() {
@@ -10628,8 +10725,10 @@ compile_short_uuid_pattern() {
 # Asks how subscription links should be generated. Non-interactive runs (piped
 # stdin / CI) silently keep the upstream defaults.
 ask_short_uuid_settings() {
+    local default_length="${1:-16}"
+
     SHORT_UUID_METHOD="nanoid"
-    SHORT_UUID_LENGTH="16"
+    SHORT_UUID_LENGTH="$default_length"
     SHORT_UUID_CUSTOM_PATTERN=""
 
     if [ ! -t 0 ]; then
@@ -10669,8 +10768,8 @@ ask_short_uuid_settings() {
     if [ "$SHORT_UUID_METHOD" = "nanoid" ]; then
         local length
         while true; do
-            read -p "Length of the random string [16-64, default 16]: " -r length
-            length="${length:-16}"
+            read -p "Length of the random string [16-64, default $default_length]: " -r length
+            length="${length:-$default_length}"
             if [[ "$length" =~ ^[0-9]+$ ]] && [ "$length" -ge 16 ] && [ "$length" -le 64 ]; then
                 SHORT_UUID_LENGTH="$length"
                 colorized_echo green "✅ nanoid($length) — e.g. $(short_uuid_random_string "$SHORT_UUID_ALPHABET" "$length")"
@@ -10698,9 +10797,9 @@ ask_short_uuid_settings() {
         read -p "Pattern (empty = go back to nanoid/16): " -r pattern
         if [ -z "$pattern" ]; then
             SHORT_UUID_METHOD="nanoid"
-            SHORT_UUID_LENGTH="16"
+            SHORT_UUID_LENGTH="$default_length"
             SHORT_UUID_CUSTOM_PATTERN=""
-            colorized_echo gray "ℹ️  Using the default: nanoid(16)"
+            colorized_echo gray "ℹ️  Using the default: nanoid($default_length)"
             return 0
         fi
         if sample=$(compile_short_uuid_pattern "$pattern"); then
@@ -14339,6 +14438,11 @@ update_command() {
         if [ "$has_env_v588_migration" = true ]; then
             migrate_env_v588
         fi
+
+        # panel 3.4.0: subscription link identifier (SHORT_UUID_*)
+        if check_short_uuid_env_migration_needed; then
+            migrate_env_short_uuid
+        fi
         if [ "$has_compose_v588_migration" = true ]; then
             migrate_compose_v588
         fi
@@ -14453,6 +14557,11 @@ update_command() {
     # v5.8.8 .env migration (Redis socket)
     if check_env_v588_migration_needed; then
         migrate_env_v588
+        env_migrated=true
+    fi
+    # panel 3.4.0: subscription link identifier (SHORT_UUID_*)
+    if check_short_uuid_env_migration_needed; then
+        migrate_env_short_uuid
         env_migrated=true
     fi
     # v5.8.8 docker-compose migration (Valkey 9, socket)

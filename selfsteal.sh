@@ -7,9 +7,9 @@
 # ║  Author:  DigneZzZ (https://github.com/DigneZzZ)               ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=2.11.0
+# VERSION=2.11.1
 
-SCRIPT_VERSION="2.11.0"
+SCRIPT_VERSION="2.11.1"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -405,6 +405,66 @@ ensure_valid_acme_account() {
     return 1
 }
 
+# acme.sh's installer refuses to run without crontab (it wants a renewal
+# job) and setup_ssl_auto_renewal() writes the crontab itself, so cron must
+# exist before acme.sh is touched. Only the Nginx auto-SSL path needs it;
+# Caddy does its own ACME. Returns 0 when crontab is usable, 1 otherwise.
+ensure_cron_installed() {
+    if command -v crontab >/dev/null 2>&1 || command -v fcrontab >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_info "Installing cron (acme.sh needs it for certificate auto-renewal)..."
+    local installed=false
+    if command -v apt-get >/dev/null 2>&1; then
+        # A failed index refresh must not block the install (cron is in the base repo)
+        apt-get update -qq >/dev/null 2>&1 || true
+        if apt-get install -y -qq cron >/dev/null 2>&1; then
+            systemctl enable --now cron >/dev/null 2>&1 || service cron start >/dev/null 2>&1 || true
+            installed=true
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        if dnf install -y -q cronie >/dev/null 2>&1; then
+            systemctl enable --now crond >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+            installed=true
+        fi
+    elif command -v yum >/dev/null 2>&1; then
+        if yum install -y -q cronie >/dev/null 2>&1; then
+            systemctl enable --now crond >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+            installed=true
+        fi
+    elif command -v pacman >/dev/null 2>&1; then
+        if pacman -S --noconfirm --needed --quiet cronie >/dev/null 2>&1; then
+            systemctl enable --now cronie >/dev/null 2>&1 || true
+            installed=true
+        fi
+    elif command -v apk >/dev/null 2>&1; then
+        if apk add --quiet cronie >/dev/null 2>&1; then
+            rc-update add cronie default >/dev/null 2>&1 || true
+            rc-service cronie start >/dev/null 2>&1 || true
+            installed=true
+        fi
+    fi
+
+    if [ "$installed" = true ] && command -v crontab >/dev/null 2>&1; then
+        log_success "cron installed and enabled"
+        return 0
+    fi
+
+    log_error "cron is not installed and could not be installed automatically"
+    echo -e "${GRAY}   acme.sh refuses to install without it. Install cron, then run the command again:${NC}"
+    if command -v apt-get >/dev/null 2>&1; then
+        echo -e "${CYAN}     apt-get install -y cron${NC}"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo -e "${CYAN}     dnf install -y cronie${NC}"
+    elif command -v yum >/dev/null 2>&1; then
+        echo -e "${CYAN}     yum install -y cronie${NC}"
+    else
+        echo -e "${CYAN}     install the 'cron' / 'cronie' package of your distribution${NC}"
+    fi
+    return 1
+}
+
 # Install acme.sh
 # $1 - domain the certificate is for, used as the account contact domain
 install_acme() {
@@ -422,6 +482,15 @@ install_acme() {
         log_error "curl is required for acme.sh installation"
         set -e
         set -o pipefail 2>/dev/null || true
+        return 1
+    fi
+
+    # acme.sh --install exits 1 without crontab (unless --force), and the
+    # renewal job is written to crontab later on — check before the
+    # "already installed" shortcut so both paths are covered.
+    if ! ensure_cron_installed; then
+        [ "$DEBUG_MODE" = false ] && set -e
+        [ "$DEBUG_MODE" = false ] && set -o pipefail 2>/dev/null || true
         return 1
     fi
     
@@ -1955,6 +2024,17 @@ check_system_requirements() {
         requirements_met=false
     else
         echo -e "${GREEN}✅ curl is available${NC}"
+    fi
+
+    # cron: acme.sh (Nginx auto-SSL) won't install without crontab and keeps
+    # its renewal job there. Caddy and --ssl-cert installs don't need it.
+    if [ "$WEB_SERVER" = "nginx" ] && [ -z "$MANUAL_SSL_CERT" ]; then
+        if ensure_cron_installed; then
+            echo -e "${GREEN}✅ cron is available (acme.sh auto-renewal)${NC}"
+        else
+            echo -e "${RED}❌ cron is required by acme.sh for Nginx auto-SSL${NC}"
+            requirements_met=false
+        fi
     fi
 
     # Check available disk space

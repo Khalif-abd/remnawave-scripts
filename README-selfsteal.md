@@ -2,7 +2,7 @@
 
 # 🎭 Selfsteal — Caddy/Nginx для Reality
 
-[![Версия](https://img.shields.io/badge/selfsteal.sh-2.11.0-blue.svg)](#-что-нового)
+[![Версия](https://img.shields.io/badge/selfsteal.sh-2.11.1-blue.svg)](#-что-нового)
 [![Веб-сервер](https://img.shields.io/badge/Caddy_%7C_Nginx-supported-brightgreen.svg)](#-сравнение-caddy-vs-nginx)
 [![Шаблоны](https://img.shields.io/badge/шаблонов-11_AI--generated-purple.svg)](#-шаблоны-сайтов)
 [![Лицензия MIT](https://img.shields.io/badge/Лицензия-MIT-yellow.svg)](./LICENSE)
@@ -21,6 +21,7 @@
 
 | Версия | Главное |
 |---|---|
+| **2.11.1** | `--nginx`: перед установкой acme.sh проверяется и при необходимости ставится cron — без `crontab` установщик acme.sh завершается ошибкой, и выпуск сертификата срывался |
 | **2.11.0** | Проверка сертификата в главном меню и в `status`: выдан ли он на используемый домен, доверенный ли (не self-signed / Caddy Local Authority), сколько дней осталось — для Nginx и Caddy (ACME-сертификат Caddy читается прямо из Docker-тома) |
 | **2.10.1** | Исправлен выпуск SSL для Nginx: ACME-контакт больше не собирается из `hostname` (`user35123@debian.debian` отклонялся Let's Encrypt), битый аккаунт чинится автоматически ([#47](https://github.com/DigneZzZ/remnawave-scripts/issues/47)) |
 | **2.10.0** | `selfsteal reissue-cert` — принудительный перевыпуск сертификата Caddy одной командой (с бэкапом и автооткатом при неудаче) |

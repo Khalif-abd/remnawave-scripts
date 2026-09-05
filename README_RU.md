@@ -58,7 +58,7 @@ sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remn
 |---|---|---|---|
 | 🚀 **remnawave.sh** | `6.7.1` | Панель: установка, Caddy, бэкапы, subscription-page | этот файл |
 | 🛰 **remnanode.sh** | `4.6.0` | Нода: Xray-core, логи, автоперезапуск | этот файл |
-| 🎭 **selfsteal.sh** | `2.11.0` | Caddy-маскировка для Reality, 11 шаблонов сайтов | [README-selfsteal](./README-selfsteal.md) |
+| 🎭 **selfsteal.sh** | `2.11.1` | Caddy-маскировка для Reality, 11 шаблонов сайтов | [README-selfsteal](./README-selfsteal.md) |
 | 🌐 **wtm.sh** | `1.5.2` | WARP + Tor: WireGuard-outbound для Xray, WARP+ | [README-warp](./README-warp.md) |
 | 🐦 **netbird.sh** | `1.4.2` | NetBird mesh-VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
 

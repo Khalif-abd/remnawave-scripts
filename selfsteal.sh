@@ -7,9 +7,9 @@
 # ║  Author:  DigneZzZ (https://github.com/DigneZzZ)               ║
 # ║  License: MIT                                                  ║
 # ╚════════════════════════════════════════════════════════════════╝
-# VERSION=2.10.1
+# VERSION=2.11.0
 
-SCRIPT_VERSION="2.10.1"
+SCRIPT_VERSION="2.11.0"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -1330,98 +1330,314 @@ WRAPPER_EOF
     return 0
 }
 
-# Check certificate expiration
-check_ssl_certificate_status() {
-    local ssl_dir="$1"
-    local cert_file="$ssl_dir/fullchain.crt"
-    
-    if [ ! -f "$cert_file" ]; then
-        echo "not_found"
-        return 1
-    fi
-    
-    # Get expiration date
-    local expiry_date
+# ============================================
+# Certificate inspection (menu / status)
+# ============================================
+# Where the certificate came from, set by load_domain_certificate() for display.
+DOMAIN_CERT_SOURCE=""
+
+# Days until the certificate expires (negative = already expired, floor
+# division so "expired 2 hours ago" is -1, not 0). Prints nothing (rc 1)
+# when the expiry date cannot be read.
+cert_days_left() {
+    local cert_file="$1"
+    local expiry_date expiry_epoch now_epoch secs_left
     expiry_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
-    
-    if [ -z "$expiry_date" ]; then
-        echo "invalid"
-        return 1
-    fi
-    
-    local expiry_epoch
-    expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_date" +%s 2>/dev/null)
-    local now_epoch
+    [ -n "$expiry_date" ] || return 1
+    expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null \
+        || date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_date" +%s 2>/dev/null) || return 1
+    [ -n "$expiry_epoch" ] || return 1
     now_epoch=$(date +%s)
-    local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
-    
-    if [ "$days_left" -lt 0 ]; then
-        echo "expired"
-    elif [ "$days_left" -lt 7 ]; then
-        echo "expiring_soon:$days_left"
-    elif [ "$days_left" -lt 30 ]; then
-        echo "warning:$days_left"
+    secs_left=$((expiry_epoch - now_epoch))
+    if [ "$secs_left" -lt 0 ]; then
+        echo $(( (secs_left - 86399) / 86400 ))
     else
-        echo "valid:$days_left"
+        echo $(( secs_left / 86400 ))
     fi
-    
+}
+
+# Issuer label for humans: the organisation ("Let's Encrypt", "ZeroSSL"),
+# falling back to the common name when the issuer has no O.
+cert_issuer_label() {
+    local cert_file="$1"
+    local names label
+    names=$(openssl x509 -issuer -noout -nameopt sep_multiline,utf8 -in "$cert_file" 2>/dev/null) || return 1
+    label=$(echo "$names" | sed -n 's/^ *O=//p' | head -1)
+    [ -n "$label" ] || label=$(echo "$names" | sed -n 's/^ *CN=//p' | head -1)
+    [ -n "$label" ] || return 1
+    echo "$label"
+}
+
+# Subject common name, or the first DNS SAN when the certificate has no CN
+# (Let's Encrypt is phasing the CN out).
+cert_subject_cn() {
+    local cert_file="$1"
+    local cn
+    cn=$(openssl x509 -subject -noout -nameopt sep_multiline,utf8 -in "$cert_file" 2>/dev/null | sed -n 's/^ *CN=//p' | head -1)
+    if [ -z "$cn" ]; then
+        cn=$(openssl x509 -ext subjectAltName -noout -in "$cert_file" 2>/dev/null \
+            | grep -o 'DNS:[^,[:space:]]*' | head -1 | sed 's/^DNS://')
+    fi
+    [ -n "$cn" ] || return 1
+    echo "$cn"
+}
+
+# Classify a certificate file against the domain it must cover. Prints:
+#   none | invalid | mismatch | selfsigned | expired |
+#   expiring_soon:<days> | warning:<days> | valid:<days>
+# "mismatch" = not issued for $domain (SAN/wildcard aware); "selfsigned" =
+# issuer equals subject or Caddy's local CA, i.e. not publicly trusted.
+# An empty domain skips the hostname check.
+classify_domain_certificate() {
+    local cert_file="$1" domain="${2:-}"
+    local subject issuer days
+    if [ ! -s "$cert_file" ]; then
+        echo "none"
+        return 0
+    fi
+    subject=$(openssl x509 -subject -noout -in "$cert_file" 2>/dev/null) || subject=""
+    if [ -z "$subject" ]; then
+        echo "invalid"
+        return 0
+    fi
+    issuer=$(openssl x509 -issuer -noout -in "$cert_file" 2>/dev/null || true)
+    if [ -n "$domain" ]; then
+        # -checkhost understands SAN and wildcards. Its exit code differs
+        # between OpenSSL versions, so go by the printed verdict.
+        if ! openssl x509 -noout -checkhost "$domain" -in "$cert_file" 2>/dev/null | grep -q "does match"; then
+            echo "mismatch"
+            return 0
+        fi
+    fi
+    if [ "${subject#subject=}" = "${issuer#issuer=}" ] || echo "$issuer" | grep -qi "Caddy Local Authority"; then
+        echo "selfsigned"
+        return 0
+    fi
+    if ! days=$(cert_days_left "$cert_file"); then
+        echo "invalid"
+        return 0
+    fi
+    if [ "$days" -lt 0 ]; then
+        echo "expired"
+    elif [ "$days" -lt 7 ]; then
+        echo "expiring_soon:$days"
+    elif [ "$days" -lt 30 ]; then
+        echo "warning:$days"
+    else
+        echo "valid:$days"
+    fi
     return 0
 }
 
-# Display SSL certificate info
+# True when the Caddy install was made with --ssl-cert/--ssl-key (the
+# Caddyfile points at /etc/caddy/ssl instead of letting Caddy run ACME).
+caddy_uses_manual_ssl() {
+    [ -f "$APP_DIR/Caddyfile" ] && grep -q "tls /etc/caddy/ssl/" "$APP_DIR/Caddyfile" 2>/dev/null
+}
+
+# Host path of the certificate the web server actually loads for $domain.
+# Nginx and manual-SSL Caddy: $APP_DIR/ssl/fullchain.crt. ACME Caddy: the
+# newest <domain>.crt in the data volume, read via the volume's host
+# mountpoint (no container needed). Prints nothing (rc 1) when absent.
+find_domain_certificate_file() {
+    local domain="$1"
+    local ssl_file="$APP_DIR/ssl/fullchain.crt"
+    if [ "$WEB_SERVER" = "nginx" ] || caddy_uses_manual_ssl; then
+        [ -f "$ssl_file" ] || return 1
+        echo "$ssl_file"
+        return 0
+    fi
+    [ -n "$domain" ] || return 1
+    local vol mountpoint newest=""
+    vol=$(get_caddy_data_volume 2>/dev/null) || return 1
+    mountpoint=$(docker volume inspect -f '{{ .Mountpoint }}' "$vol" 2>/dev/null) || return 1
+    [ -n "$mountpoint" ] && [ -d "$mountpoint" ] || return 1
+    newest=$(ls -t "$mountpoint"/caddy/certificates/*/"$domain"/"$domain".crt 2>/dev/null | head -1) || true
+    [ -n "$newest" ] && [ -r "$newest" ] || return 1
+    echo "$newest"
+}
+
+# PEM of the certificate the web server uses for $domain, to stdout (empty
+# when none). When Caddy's volume mountpoint is not readable from the host
+# (rootless / snap Docker) fall back to reading through the running
+# container, then through a throwaway one (only if the image is local, so
+# the menu never blocks on a pull). Sets DOMAIN_CERT_SOURCE for display.
+load_domain_certificate() {
+    local domain="$1"
+    local file vol pem=""
+    DOMAIN_CERT_SOURCE=""
+    if file=$(find_domain_certificate_file "$domain"); then
+        DOMAIN_CERT_SOURCE="$file"
+        cat "$file" 2>/dev/null || true
+        return 0
+    fi
+    if [ "$WEB_SERVER" = "nginx" ] || caddy_uses_manual_ssl || [ -z "$domain" ]; then
+        return 0
+    fi
+    vol=$(get_caddy_data_volume 2>/dev/null) || return 0
+    pem=$(docker exec "$CONTAINER_NAME" sh -c \
+        "f=\$(ls -t /data/caddy/certificates/*/${domain}/${domain}.crt 2>/dev/null | head -1); [ -n \"\$f\" ] && cat \"\$f\"" 2>/dev/null || true)
+    if [ -z "$pem" ] && docker image inspect "caddy:${CADDY_VERSION}" >/dev/null 2>&1; then
+        pem=$(read_caddy_stored_cert "$vol" "$domain")
+    fi
+    if [ -n "$pem" ]; then
+        DOMAIN_CERT_SOURCE="docker volume $vol"
+        printf '%s\n' "$pem"
+    fi
+    return 0
+}
+
+# One-line summary for the menu: "<status>|<issuer>|<cert name>|<source>"
+describe_domain_certificate() {
+    local domain="$1"
+    local tmp status="none" issuer="" cn=""
+    tmp=$(mktemp 2>/dev/null) || { echo "none|||"; return 0; }
+    load_domain_certificate "$domain" > "$tmp"
+    if [ -s "$tmp" ]; then
+        status=$(classify_domain_certificate "$tmp" "$domain")
+        issuer=$(cert_issuer_label "$tmp" 2>/dev/null || true)
+        cn=$(cert_subject_cn "$tmp" 2>/dev/null || true)
+    fi
+    rm -f "$tmp"
+    echo "${status}|${issuer}|${cn}|${DOMAIN_CERT_SOURCE:-}"
+}
+
+# Render the "SSL:" line of the main menu. Returns 0 when the certificate
+# is fine, 1 when the operator should act (the caller shows a tip).
+print_menu_ssl_line() {
+    local domain="$1"
+    local summary status rest issuer cn suffix="" days
+    summary=$(describe_domain_certificate "$domain")
+    status=${summary%%|*}
+    rest=${summary#*|}; issuer=${rest%%|*}
+    rest=${rest#*|};    cn=${rest%%|*}
+    [ -n "$issuer" ] && suffix=" ($issuer)"
+    case "$status" in
+        valid:*)
+            printf "   ${WHITE}%-10s${NC} ${GREEN}✅ Valid, %s days left%s${NC}\n" "SSL:" "${status#valid:}" "$suffix"
+            return 0
+            ;;
+        warning:*)
+            printf "   ${WHITE}%-10s${NC} ${YELLOW}⚠️  Valid, renew soon: %s days left%s${NC}\n" "SSL:" "${status#warning:}" "$suffix"
+            return 0
+            ;;
+        expiring_soon:*)
+            days=${status#expiring_soon:}
+            if [ "$days" -eq 0 ]; then
+                printf "   ${WHITE}%-10s${NC} ${RED}🔴 Expires today%s${NC}\n" "SSL:" "$suffix"
+            else
+                printf "   ${WHITE}%-10s${NC} ${RED}🔴 Expires in %s days%s${NC}\n" "SSL:" "$days" "$suffix"
+            fi
+            ;;
+        expired)
+            printf "   ${WHITE}%-10s${NC} ${RED}❌ Expired%s${NC}\n" "SSL:" "$suffix"
+            ;;
+        selfsigned)
+            printf "   ${WHITE}%-10s${NC} ${YELLOW}⚠️  Self-signed, not trusted%s${NC}\n" "SSL:" "$suffix"
+            ;;
+        mismatch)
+            printf "   ${WHITE}%-10s${NC} ${YELLOW}⚠️  Issued for %s, not %s${NC}\n" "SSL:" "${cn:-another domain}" "$domain"
+            ;;
+        invalid)
+            printf "   ${WHITE}%-10s${NC} ${RED}❌ Unreadable certificate${NC}\n" "SSL:"
+            ;;
+        *)
+            printf "   ${WHITE}%-10s${NC} ${RED}❌ No certificate issued for %s yet${NC}\n" "SSL:" "$domain"
+            ;;
+    esac
+    return 1
+}
+
+# Display certificate details for a PEM file. $domain (optional) enables the
+# hostname check; $source (optional) is shown as "Storage:".
 show_ssl_certificate_info() {
-    local ssl_dir="$1"
-    local cert_file="$ssl_dir/fullchain.crt"
-    
-    if [ ! -f "$cert_file" ]; then
+    local cert_file="$1" domain="${2:-}" source="${3:-}"
+
+    if [ ! -s "$cert_file" ]; then
         log_warning "Certificate file not found: $cert_file"
         return 1
     fi
-    
+
     echo -e "${WHITE}🔐 SSL Certificate Information${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
-    
-    # Get certificate details
-    local subject
+
+    local subject issuer expiry start
     subject=$(openssl x509 -subject -noout -in "$cert_file" 2>/dev/null | sed 's/subject=//')
-    local issuer
     issuer=$(openssl x509 -issuer -noout -in "$cert_file" 2>/dev/null | sed 's/issuer=//')
-    local expiry
     expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | sed 's/notAfter=//')
-    local start
     start=$(openssl x509 -startdate -noout -in "$cert_file" 2>/dev/null | sed 's/notBefore=//')
-    
+
     printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Subject:" "$subject"
     printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Issuer:" "$issuer"
     printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Valid From:" "$start"
     printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Valid Until:" "$expiry"
-    
-    # Check status
-    local status
-    status=$(check_ssl_certificate_status "$ssl_dir")
-    
+    if [ -n "$source" ]; then
+        printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Storage:" "$source"
+    fi
+
+    local status days
+    status=$(classify_domain_certificate "$cert_file" "$domain")
+
+    if [ -n "$domain" ]; then
+        if [ "$status" = "mismatch" ]; then
+            echo -e "   ${WHITE}Domain:${NC}         ${RED}❌ does not cover $domain${NC}"
+        elif [ "$status" != "invalid" ]; then
+            echo -e "   ${WHITE}Domain:${NC}         ${GREEN}✅ covers $domain${NC}"
+        fi
+    fi
+
     case "$status" in
         valid:*)
-            local days="${status#valid:}"
+            days="${status#valid:}"
             echo -e "   ${WHITE}Status:${NC}         ${GREEN}✅ Valid ($days days remaining)${NC}"
             ;;
         warning:*)
-            local days="${status#warning:}"
+            days="${status#warning:}"
             echo -e "   ${WHITE}Status:${NC}         ${YELLOW}⚠️  Renewal recommended ($days days remaining)${NC}"
             ;;
         expiring_soon:*)
-            local days="${status#expiring_soon:}"
+            days="${status#expiring_soon:}"
             echo -e "   ${WHITE}Status:${NC}         ${RED}🔴 Expiring soon! ($days days remaining)${NC}"
             ;;
         expired)
             echo -e "   ${WHITE}Status:${NC}         ${RED}❌ EXPIRED${NC}"
             ;;
+        selfsigned)
+            echo -e "   ${WHITE}Status:${NC}         ${YELLOW}⚠️  Self-signed / local CA — not publicly trusted${NC}"
+            ;;
+        mismatch)
+            echo -e "   ${WHITE}Status:${NC}         ${YELLOW}⚠️  Issued for a different domain${NC}"
+            ;;
         *)
             echo -e "   ${WHITE}Status:${NC}         ${YELLOW}⚠️  Unknown${NC}"
             ;;
     esac
-    
+
     echo
+}
+
+# Certificate block for `status`: works for Nginx, manual-SSL Caddy and
+# ACME Caddy (whose certificate lives in the Docker volume).
+show_domain_certificate_info() {
+    local domain="$1"
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || return 1
+    load_domain_certificate "$domain" > "$tmp"
+    if [ -s "$tmp" ]; then
+        show_ssl_certificate_info "$tmp" "$domain" "$DOMAIN_CERT_SOURCE"
+    else
+        echo -e "${WHITE}🔐 SSL Certificate Information${NC}"
+        echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
+        echo -e "   ${RED}❌ No certificate issued for ${domain:-this domain} yet${NC}"
+        if [ "$WEB_SERVER" = "nginx" ]; then
+            echo -e "${GRAY}   Obtain one with: ${CYAN}$APP_NAME renew-ssl${NC}"
+        else
+            echo -e "${GRAY}   Caddy requests it on start (needs :80 reachable + correct DNS).${NC}"
+            echo -e "${GRAY}   Watch: ${CYAN}$APP_NAME logs${NC}${GRAY}   Force: ${CYAN}$APP_NAME reissue-cert${NC}"
+        fi
+        echo
+    fi
+    rm -f "$tmp"
 }
 
 
@@ -2419,7 +2635,7 @@ EOF
         fi
         
         # Show certificate info
-        show_ssl_certificate_info "$APP_DIR/ssl"
+        show_ssl_certificate_info "$APP_DIR/ssl/fullchain.crt" "$domain"
     else
         # Use ACME for certificate
         # Pre-check: verify ACME port is available
@@ -4309,10 +4525,10 @@ status_command() {
     printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "HTML Path:" "$HTML_DIR"
     printf "   ${WHITE}%-15s${NC} ${GRAY}%s${NC}\n" "Script Version:" "v$SCRIPT_VERSION"
     
-    # Show SSL certificate info for Nginx
-    if [ "$WEB_SERVER" = "nginx" ] && [ -f "$APP_DIR/ssl/fullchain.crt" ]; then
+    # Certificate the server actually serves (Caddy keeps its ACME cert in the data volume)
+    if [ -n "$domain" ] || [ -f "$APP_DIR/ssl/fullchain.crt" ]; then
         echo
-        show_ssl_certificate_info "$APP_DIR/ssl"
+        show_domain_certificate_info "$domain"
     fi
 }
 
@@ -4360,10 +4576,14 @@ renew_ssl_command() {
     echo -e "${WHITE}🔐 SSL Certificate Renewal${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 35))${NC}"
     echo
-    
+
+    # Domain from config: drives the hostname check and issuance below
+    local domain
+    domain=$(grep "SELF_STEAL_DOMAIN=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
+
     # Show current certificate info
     if [ -f "$APP_DIR/ssl/fullchain.crt" ]; then
-        show_ssl_certificate_info "$APP_DIR/ssl"
+        show_ssl_certificate_info "$APP_DIR/ssl/fullchain.crt" "$domain"
         echo
     fi
     
@@ -4376,10 +4596,6 @@ renew_ssl_command() {
         # Offer to get a proper certificate
         read -p "Would you like to obtain a Let's Encrypt certificate now? [Y/n]: " -r get_cert
         if [[ ! $get_cert =~ ^[Nn]$ ]]; then
-            # Get domain from config
-            local domain
-            domain=$(grep "SELF_STEAL_DOMAIN=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2)
-            
             if [ -z "$domain" ]; then
                 log_error "Could not determine domain from configuration"
                 return 1
@@ -4426,19 +4642,11 @@ renew_ssl_command() {
         return 0
     fi
     
-    # Get domain from config
-    local domain
-    domain=$(grep "SELF_STEAL_DOMAIN=" "$APP_DIR/.env" 2>/dev/null | cut -d'=' -f2)
-    
     if [ -z "$domain" ]; then
         log_error "Could not determine domain from configuration"
         return 1
     fi
-    
-    # Check certificate status
-    local status
-    status=$(check_ssl_certificate_status "$APP_DIR/ssl")
-    
+
     echo -e "${WHITE}Options:${NC}"
     echo -e "   ${WHITE}1)${NC} ${GRAY}Check and renew if needed (automatic)${NC}"
     echo -e "   ${WHITE}2)${NC} ${GRAY}Force renewal${NC}"
@@ -4462,7 +4670,7 @@ renew_ssl_command() {
                 
                 # Show updated status
                 echo
-                show_ssl_certificate_info "$APP_DIR/ssl"
+                show_ssl_certificate_info "$APP_DIR/ssl/fullchain.crt" "$domain"
             fi
             ;;
         2)
@@ -4516,7 +4724,7 @@ renew_ssl_command() {
             cd "$APP_DIR" && docker compose up -d
             
             echo
-            show_ssl_certificate_info "$APP_DIR/ssl"
+            show_ssl_certificate_info "$APP_DIR/ssl/fullchain.crt" "$domain"
             ;;
         *)
             echo -e "${GRAY}Renewal cancelled${NC}"
@@ -4586,7 +4794,7 @@ reissue_caddy_cert() {
     echo
 
     # Manual-SSL installs (--ssl-cert/--ssl-key) have no ACME cert to re-issue.
-    if [ -f "$APP_DIR/Caddyfile" ] && grep -q "tls /etc/caddy/ssl/" "$APP_DIR/Caddyfile" 2>/dev/null; then
+    if caddy_uses_manual_ssl; then
         log_warning "This installation uses a manual SSL certificate (--ssl-cert/--ssl-key)."
         echo -e "${GRAY}   There is no ACME certificate to re-issue.${NC}"
         echo -e "${GRAY}   To replace it, copy new files into ${APP_DIR}/ssl/ and run:${NC}"
@@ -5549,7 +5757,12 @@ main_menu() {
         if [ -n "$port" ]; then
             printf "   ${WHITE}%-10s${NC} ${GRAY}%s${NC}\n" "Port:" "$port"
         fi
-        
+        # Certificate for the configured domain: issued? for this host? trusted? expiring?
+        local ssl_ok=true
+        if [ -n "$domain" ] && [ "$menu_status" != "Not installed" ]; then
+            print_menu_ssl_line "$domain" || ssl_ok=false
+        fi
+
         if [ "$menu_status" = "Error (Restarting)" ]; then
             echo
             echo -e "${YELLOW}⚠️  Service is experiencing issues!${NC}"
@@ -5604,7 +5817,11 @@ main_menu() {
                 echo -e "${BLUE}💡 Tip: Check logs (8) to diagnose issues${NC}"
                 ;;
             "Running")
-                echo -e "${BLUE}💡 Tip: Use option 6 to customize website templates${NC}"
+                if [ "$ssl_ok" = false ]; then
+                    echo -e "${BLUE}💡 Tip: Certificate needs attention — option 5 for details, option 12 to renew/re-issue${NC}"
+                else
+                    echo -e "${BLUE}💡 Tip: Use option 6 to customize website templates${NC}"
+                fi
                 ;;
         esac
 

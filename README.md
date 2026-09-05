@@ -58,7 +58,7 @@ After installation each script is a global command: `remnawave`, `remnanode`, `s
 |---|---|---|---|
 | 🚀 **remnawave.sh** | `6.7.1` | Panel: install, Caddy, backups, subscription-page | this file |
 | 🛰 **remnanode.sh** | `4.6.0` | Node: Xray-core, logs, auto-restart | this file |
-| 🎭 **selfsteal.sh** | `2.10.1` | Caddy masking for Reality, 11 website templates | [README-selfsteal](./README-selfsteal.md) |
+| 🎭 **selfsteal.sh** | `2.11.0` | Caddy masking for Reality, 11 website templates | [README-selfsteal](./README-selfsteal.md) |
 | 🌐 **wtm.sh** | `1.5.2` | WARP + Tor: WireGuard outbound for Xray, WARP+ | [README-warp](./README-warp.md) |
 | 🐦 **netbird.sh** | `1.4.2` | NetBird mesh VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
 
@@ -205,6 +205,7 @@ sudo bash <(curl -Ls https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main
 - **11 website templates** for camouflage: social, converters, file clouds, speedtest, and more
 - **Anti-fingerprint** — every template is uniquified on install (no byte-identical copies), provenance traces stripped
 - **Built-in guide** for Reality integration (`selfsteal guide`)
+- **Certificate check** in the menu and `status`: issued for the current domain, publicly trusted, days left (Caddy's ACME cert is read from its Docker volume)
 
 ```bash
 selfsteal template list                 # list templates

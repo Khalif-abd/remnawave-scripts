@@ -2,7 +2,7 @@
 
 # 🎭 Selfsteal — Caddy/Nginx для Reality
 
-[![Версия](https://img.shields.io/badge/selfsteal.sh-2.10.1-blue.svg)](#-что-нового)
+[![Версия](https://img.shields.io/badge/selfsteal.sh-2.11.0-blue.svg)](#-что-нового)
 [![Веб-сервер](https://img.shields.io/badge/Caddy_%7C_Nginx-supported-brightgreen.svg)](#-сравнение-caddy-vs-nginx)
 [![Шаблоны](https://img.shields.io/badge/шаблонов-11_AI--generated-purple.svg)](#-шаблоны-сайтов)
 [![Лицензия MIT](https://img.shields.io/badge/Лицензия-MIT-yellow.svg)](./LICENSE)
@@ -21,6 +21,7 @@
 
 | Версия | Главное |
 |---|---|
+| **2.11.0** | Проверка сертификата в главном меню и в `status`: выдан ли он на используемый домен, доверенный ли (не self-signed / Caddy Local Authority), сколько дней осталось — для Nginx и Caddy (ACME-сертификат Caddy читается прямо из Docker-тома) |
 | **2.10.1** | Исправлен выпуск SSL для Nginx: ACME-контакт больше не собирается из `hostname` (`user35123@debian.debian` отклонялся Let's Encrypt), битый аккаунт чинится автоматически ([#47](https://github.com/DigneZzZ/remnawave-scripts/issues/47)) |
 | **2.10.0** | `selfsteal reissue-cert` — принудительный перевыпуск сертификата Caddy одной командой (с бэкапом и автооткатом при неудаче) |
 | **2.9.0** | Устойчивое получение Docker-образов: fallback на зеркала, когда Docker Hub недоступен/заблокирован |
@@ -92,7 +93,7 @@ selfsteal          # интерактивное меню
 | Команда | Описание |
 |---|---|
 | `install` / `uninstall` | Установка / удаление (только один веб-сервер одновременно) |
-| `up` / `down` / `restart` / `status` / `logs` | Управление сервисами, статус с информацией о SSL |
+| `up` / `down` / `restart` / `status` / `logs` | Управление сервисами; `status` показывает сертификат: домен, издатель, доверие, срок (для Caddy — из Docker-тома) |
 | `template` | Выбор/смена шаблона (с бэкапом предыдущего) |
 | `edit` | Редактирование конфигурации |
 | `renew-ssl` | Обновить сертификат (Caddy — форс-перевыпуск, Nginx — acme.sh) |
@@ -234,8 +235,10 @@ ss -tlnp | grep ':80\|:9443'      # порты свободны?
 ```bash
 dig your-domain.com A             # DNS указывает на сервер?
 ls -la /opt/nginx-selfsteal/html/ # файлы шаблона на месте?
-selfsteal status                  # статус + информация о сертификате
+selfsteal status                  # статус + проверка сертификата
 ```
+
+Строка `SSL:` в шапке главного меню сразу показывает, выдан ли сертификат на используемый домен, доверенный ли он (не self-signed) и сколько дней осталось; подробности — в `status`, лечение — `renew-ssl` / `reissue-cert`.
 
 Для Nginx ACME нужен свободный порт из ряда 8443+ (или задайте `--acme-port`); порт нужен только на время выпуска/обновления.
 
